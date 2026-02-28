@@ -1,4 +1,3 @@
-
 from pyrogram import Client, filters
 from pyrogram.types import ChatPermissions
 from pyrogram.enums import ChatMemberStatus
@@ -7,6 +6,7 @@ from datetime import datetime, timedelta
 import re
 import dateparser
 from functools import wraps
+import asyncio
 
 # --- Configuration ---
 API_ID = 34257542
@@ -319,6 +319,13 @@ async def welcome(client, message):
         user_stats[message.chat.id][m.id] = {"count": 0, "date": datetime.now()}
         await message.reply_text(welcome_text)
 
-print("Bot starting...")
-scheduler.start()
-app.run()
+# --- Proper Execution Section ---
+async def main():
+    print("Bot starting...")
+    scheduler.start()
+    await app.start()
+    print("Bot is alive!")
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    app.run(main())
