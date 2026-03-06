@@ -19,8 +19,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 API_ID = 34257542
-API_HASH = 614a1b5c5b712ac6de5530d5c571c42a
-BOT_TOKEN = 7957660443:AAFOZTMcDv-eg9mKLtkvK01Trv-zzRQbwWw
+API_HASH = "614a1b5c5b712ac6de5530d5c571c42a"
+BOT_TOKEN = "7957660443:AAFOZTMcDv-eg9mKLtkvK01Trv-zzRQbwWw"
 
 app = Client("fajr_jadid_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = AsyncIOScheduler(timezone="Asia/Riyadh")
@@ -859,5 +859,6 @@ if _name_ == "_main_":
     schedule_existing_reminders()
     print("Bot running...")
     app.run()
+
 
 
