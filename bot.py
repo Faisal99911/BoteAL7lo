@@ -1,6 +1,7 @@
 from telethon import TelegramClient, events, functions, types
 import asyncio
 import datetime
+import re
 
 # --- الإعدادات الأساسية ---
 api_id = 34257542
@@ -10,21 +11,21 @@ owner_id = 1486879970
 
 client = TelegramClient('bot_session', api_id, api_hash).start(bot_token=bot_token)
 
-# قواعد بيانات مؤقتة (يفضل استخدام SQL في المشاريع الضخمة)
-custom_responses = {} # للنصوص
-custom_media = {}     # للصور والفيديوهات
-warns = {}            # الإنذارات
-stats = {}            # الإحصائيات (عدد الرسائل)
-group_members = {}    # لترتيب المتفاعلين
+custom_responses = {} 
+custom_media = {}     
+warns = {}            
+stats = {}            
 
-# دالة التحقق من الصلاحيات (مالك أو مشرف)
 async def is_admin(event):
     if event.sender_id == owner_id:
         return True
-    permissions = await client.get_permissions(event.chat_id, event.sender_id)
-    return permissions.is_admin
+    try:
+        permissions = await client.get_permissions(event.chat_id, event.sender_id)
+        return permissions.is_admin
+    except:
+        return False
 
-# --- 1. رسالة الترحيب مع المنشن المخفي ---
+# --- 1. رسالة الترحيب ---
 @client.on(events.ChatAction)
 async def welcome(event):
     if event.user_joined:
@@ -40,7 +41,7 @@ async def welcome(event):
         )
         await event.reply(welcome_msg)
 
-# --- 2. ميزة المنشن الجماعي (all) ---
+# --- 2. ميزة المنشن الجماعي ---
 @client.on(events.NewMessage(pattern=r'(?i)^all(?:\s+(.*))?'))
 async def mention_all(event):
     if not await is_admin(event):
@@ -56,35 +57,36 @@ async def mention_all(event):
         chunk = mentions[i:i+5]
         msg = f"{extra_text}\n" + " ".join(chunk)
         await client.send_message(event.chat_id, msg)
-        await asyncio.sleep(0.5) # سرعة عالية مع تجنب الحظر
+        await asyncio.sleep(0.5)
 
-# --- 3. ميزة الردود النصية (رد السلام عليكم وعليكم السلام) ---
-@client.on(events.NewMessage(pattern=r'^رد \((.*)\) \((.*)\)'))
+# --- 3. ميزة الردود النصية (تم التعديل لحل مشكلة المسافات) ---
+@client.on(events.NewMessage(pattern=r'^رد\s*\((.*)\)\s*\((.*)\)'))
 async def add_text_reply(event):
     if not await is_admin(event): return
-    word = event.pattern_match.group(1)
-    reply = event.pattern_match.group(2)
+    # استخدام .strip() لإزالة المسافات الزائدة من البداية والنهاية
+    word = event.pattern_match.group(1).strip()
+    reply = event.pattern_match.group(2).strip()
     custom_responses[word] = reply
-    await event.reply("تمت اضافة النص ✅")
+    await event.reply(f"تمت اضافة الرد للكلمة: **{word}** ✅")
 
-# --- 4. ميزة الميديا (صورة/فيديو + نص) ---
-@client.on(events.NewMessage(pattern=r'^(صوره|فيديو) (.*)'))
+# --- 4. ميزة الميديا ---
+@client.on(events.NewMessage(pattern=r'^(صوره|فيديو)\s+(.*)'))
 async def add_media_step1(event):
     if not await is_admin(event): return
     media_type = event.pattern_match.group(1)
-    trigger_text = event.pattern_match.group(2)
+    trigger_text = event.pattern_match.group(2).strip()
     
     async with client.conversation(event.chat_id) as conv:
         await conv.send_message(f"حسنا ارسل ال{media_type}")
         response = await conv.get_response()
         if response.media:
             custom_media[trigger_text] = response.media
-            await response.reply(f"تمت اضافة ال{media_type} ✅")
+            await response.reply(f"تمت اضافة ال{media_type} للكلمة: **{trigger_text}** ✅")
 
 # --- 5. ميزة الكتم والإنذار ---
 @client.on(events.NewMessage)
 async def moderation_tools(event):
-    if not event.is_reply: return
+    if not event.is_reply or not event.text: return
     reply_msg = await event.get_reply_message()
     user_id = reply_msg.sender_id
 
@@ -109,28 +111,23 @@ async def moderation_tools(event):
         else:
             await event.reply(f"تم إعطاء انذار للعضو ({count}/3) ⚠️")
 
-# --- 6. ميزة الملف الشخصي (عند كتابة "ا") ---
+# --- 6. ميزة الملف الشخصي (بالصيغة المطلوبة) ---
 @client.on(events.NewMessage(pattern=r'^[اأإآ]$'))
 async def profile_stats(event):
     user = await event.get_sender()
     user_id = user.id
-    
-    # تحديث الإحصائيات
     msg_count = stats.get(user_id, 0) + 1
     stats[user_id] = msg_count
     
-    # الترتيب
     sorted_users = sorted(stats.items(), key=lambda x: x[1], reverse=True)
     rank = next((i + 1 for i, (uid, count) in enumerate(sorted_users) if uid == user_id), 1)
     
-    # محاولة الحصول على تاريخ انضمام المستخدم
     try:
         user_entity = await client.get_entity(user_id)
         join_date = user_entity.date.strftime("%Y-%m-%d")
-    except Exception:
+    except:
         join_date = "غير متوفر"
     
-    # الصيغة المطلوبة التي حددتها
     caption = (
         f"✨ **ملفك الشخصي في فجـر جـديد** ✨\n\n"
         f"**إحصائياتك:**\n"
@@ -157,19 +154,24 @@ async def help_edit(event):
     )
     await event.reply(help_text)
 
-# --- معالج الردود الذكي (نصوص + ميديا) ---
+# --- معالج الردود الذكي (تم تحسينه ليتجاهل المسافات) ---
 @client.on(events.NewMessage)
 async def dynamic_replies(event):
-    # تحديث العداد لكل رسالة
+    if not event.text: return
+    
+    # تحديث العداد
     stats[event.sender_id] = stats.get(event.sender_id, 0) + 1
     
+    # تنظيف النص المدخل من المسافات للمقارنة
+    input_text = event.text.strip()
+    
     # ردود النصوص
-    if event.text in custom_responses:
-        await event.reply(custom_responses[event.text])
+    if input_text in custom_responses:
+        await event.reply(custom_responses[input_text])
     
     # ردود الميديا
-    if event.text in custom_media:
-        await client.send_file(event.chat_id, custom_media[event.text], reply_to=event.id)
+    if input_text in custom_media:
+        await client.send_file(event.chat_id, custom_media[input_text], reply_to=event.id)
 
 print("البوت يعمل الآن بنجاح...")
 client.run_until_disconnected()
