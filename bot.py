@@ -110,7 +110,7 @@ async def moderation_tools(event):
             await event.reply(f"تم إعطاء انذار للعضو ({count}/3) ⚠️")
 
 # --- 6. ميزة الملف الشخصي (عند كتابة "ا") ---
-@client.on(events.NewMessage(pattern=r'^ا$'))
+    @client.on(events.NewMessage(pattern=r'^[اأإآ]$'))
 async def profile_stats(event):
     user = await event.get_sender()
     user_id = user.id
@@ -123,14 +123,22 @@ async def profile_stats(event):
     sorted_users = sorted(stats.items(), key=lambda x: x[1], reverse=True)
     rank = next((i + 1 for i, (uid, count) in enumerate(sorted_users) if uid == user_id), 1)
     
-    join_date = "غير متوفر" # التاريخ الفعلي يحتاج صلاحيات مشرف كاملة
+    # محاولة الحصول على تاريخ انضمام المستخدم
+    try:
+        # استخدام get_entity للحصول على معلومات المستخدم بما في ذلك تاريخ الإنشاء
+        user_entity = await client.get_entity(user_id)
+        join_date = user_entity.date.strftime("%Y-%m-%d") # تنسيق التاريخ الميلادي
+    except Exception:
+        join_date = "غير متوفر"
     
     caption = (
-        f"👤 **بياناتك يا بطل:**\n\n"
-        f"✉️ عدد رسائلك: `{msg_count}`\n"
-        f"🏆 ترتيبك في المتفاعلين: `{rank}`\n"
-        f"📅 تاريخ انضمامك: قريباً\n\n"
-        f"استمر في التفاعل لرفع ترتيبك! ✨"
+        f"✨ **ملفك الشخصي في فجـر جـديد** ✨\n\n"
+        f"مرحباً بك يا {user.first_name or 'عضو جديد'}! يسعدنا وجودك معنا.\n\n"
+        f"**إحصائياتك:**\n"
+        f"  ✉️ عدد رسائلك: `{msg_count}`\n"
+        f"  🏆 ترتيبك في المتفاعلين: `{rank}`\n"
+        f"  📅 تاريخ انضمامك: `{join_date}`\n\n"
+        f"استمر في التفاعل والمشاركة لتصنع فرقاً وتزيد من ترتيبك! 🚀"
     )
     
     photo = await client.download_profile_photo(user_id)
