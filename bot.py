@@ -110,8 +110,8 @@ async def moderation_tools(event):
             await event.reply(f"تم إعطاء انذار للعضو ({count}/3) ⚠️")
 
 # --- 6. ميزة الملف الشخصي (عند كتابة "ا") ---
-    @client.on(events.NewMessage(pattern=r'^[اأإآ]$'))
-    async def profile_stats(event):
+@client.on(events.NewMessage(pattern=r'^[اأإآ]$'))
+async def profile_stats(event):
     user = await event.get_sender()
     user_id = user.id
     
