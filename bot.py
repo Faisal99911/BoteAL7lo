@@ -119,21 +119,20 @@ async def profile_stats(event):
     msg_count = stats.get(user_id, 0) + 1
     stats[user_id] = msg_count
     
-    # الترتيب (بسيط بناءً على الجلسة الحالية)
+    # الترتيب
     sorted_users = sorted(stats.items(), key=lambda x: x[1], reverse=True)
     rank = next((i + 1 for i, (uid, count) in enumerate(sorted_users) if uid == user_id), 1)
     
     # محاولة الحصول على تاريخ انضمام المستخدم
     try:
-        # استخدام get_entity للحصول على معلومات المستخدم بما في ذلك تاريخ الإنشاء
         user_entity = await client.get_entity(user_id)
-        join_date = user_entity.date.strftime("%Y-%m-%d") # تنسيق التاريخ الميلادي
+        join_date = user_entity.date.strftime("%Y-%m-%d")
     except Exception:
         join_date = "غير متوفر"
     
+    # الصيغة المطلوبة التي حددتها
     caption = (
         f"✨ **ملفك الشخصي في فجـر جـديد** ✨\n\n"
-        f"مرحباً بك يا {user.first_name or 'عضو جديد'}! يسعدنا وجودك معنا.\n\n"
         f"**إحصائياتك:**\n"
         f"  ✉️ عدد رسائلك: `{msg_count}`\n"
         f"  🏆 ترتيبك في المتفاعلين: `{rank}`\n"
@@ -142,9 +141,12 @@ async def profile_stats(event):
     )
     
     photo = await client.download_profile_photo(user_id)
-    await client.send_file(event.chat_id, photo, caption=caption)
+    if photo:
+        await client.send_file(event.chat_id, photo, caption=caption)
+    else:
+        await event.reply(caption)
 
-# --- 7. ميزة الحذف والتعديل (شرح مختصر) ---
+# --- 7. ميزة الحذف والتعديل ---
 @client.on(events.NewMessage(pattern='^كيف احذف$'))
 async def help_edit(event):
     help_text = (
