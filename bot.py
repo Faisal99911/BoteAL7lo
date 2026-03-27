@@ -111,7 +111,7 @@ async def moderation_tools(event):
 
 # --- 6. ميزة الملف الشخصي (عند كتابة "ا") ---
     @client.on(events.NewMessage(pattern=r'^[اأإآ]$'))
-async def profile_stats(event):
+    async def profile_stats(event):
     user = await event.get_sender()
     user_id = user.id
     
