@@ -9,7 +9,7 @@ from functools import wraps
 # ===== إعداداتك (لم يتم التعديل عليها) =====
 API_ID = 34257542
 API_HASH = '614a1b5c5b712ac6de5530d5c571c42a'
-BOT_TOKEN = '8574757379:AAF0oDI-L00mf7xDfONyOY17lLplPSo58xA'
+BOT_TOKEN = '7957660443:AAFOZTMcDv-eg9mKLtkvK01Trv-zzRQbwWw'
 OWNER_ID = 1486879970
 
 # ===== ملفات =====
