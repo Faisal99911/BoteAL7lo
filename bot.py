@@ -34,7 +34,6 @@ def load_db():
 def create_empty_db():
     return {
         "responses": {},
-        "media": {}, # {word: file_id}
         "stats": {},
         "meta": {"created": str(datetime.datetime.now())}
     }
@@ -52,7 +51,10 @@ def save_db():
 # 3. أدوات مساعدة
 # =========================
 
-last_actions = {} # {bot_msg_id: (type, key, user_msg_id)}
+last_actions = {}
+
+if "media" in db:
+    del db["media"]
 
 async def is_admin(event):
     if event.sender_id == owner_id:
@@ -66,16 +68,16 @@ async def is_admin(event):
         return False
 
 # =========================
-# 4. الترحيب المطور (منشن + صورة المجموعة)
+# 4. الترحيب (صورة العضو + منشن)
 # =========================
 
 @client.on(events.ChatAction)
 async def welcome(event):
     if event.user_joined:
         user = await event.get_user()
-        # رسالة الترحيب مع المنشن المخفي
+
         welcome_text = (
-            f"اهلاً بك في فجـر جـديد [\u200b](tg://user?id={user.id}) 🙋🏻‍♂️\n\n"
+            f"اهلاً بك [{user.first_name}](tg://user?id={user.id}) 🙋🏻‍♂️\n\n"
             "خطوة صغيرة اليوم… تصنع فرق كبير غدًا 🌅\n\n"
             "• ممنوع السلبية أو إحباط الآخرين ❌\n"
             "• لا يُسمح بأي محتوى غير لائق 🚫\n"
@@ -83,12 +85,9 @@ async def welcome(event):
             "• شارك بما يفيد ويحفّز غيرك 📌\n"
             "• التزامك اليوم هو نجاحك غداً 🌇"
         )
-        
+
         try:
-            # محاولة الحصول على صورة المجموعة
-            chat = await event.get_chat()
-            photo = await client.download_profile_photo(chat, file=bytes)
-            
+            photo = await client.download_profile_photo(user.id)
             if photo:
                 await client.send_file(event.chat_id, photo, caption=welcome_text)
             else:
@@ -115,56 +114,6 @@ async def add_text_reply(event):
     last_actions[m.id] = ("text", word, event.id)
 
 # =========================
-# 6. إضافة رد ميديا (صورة/فيديو) - إصلاح المشكلة
-# =========================
-
-@client.on(events.NewMessage(pattern=r'^(صوره|فيديو)\s+\((.*)\)'))
-async def add_media_reply(event):
-    if not await is_admin(event): return
-    
-    media_type = event.pattern_match.group(1)
-    word = event.pattern_match.group(2).strip()
-    
-    # إرسال رسالة الطلب
-    ask_msg = await event.reply(f"📩 حسناً، أرسل ال{media_type} الآن (أو قم بعمل ريبلاي عليه) لحفظه للكلمة: ({word})")
-    
-    # دالة التحقق: يجب أن تكون الرسالة من نفس المستخدم وفي نفس الدردشة
-    def check(m):
-        return m.sender_id == event.sender_id and m.chat_id == event.chat_id and (m.media or (m.is_reply and m.reply_to_msg_id))
-
-    try:
-        # انتظار الرد لمدة دقيقة
-        response = await client.wait_for(events.NewMessage(func=check), timeout=60)
-        
-        target_msg = response
-        # إذا قام المستخدم بعمل ريبلاي على ميديا قديمة بدلاً من إرسال واحدة جديدة
-        if response.is_reply and not response.media:
-            target_msg = await response.get_reply_message()
-            
-        if target_msg and target_msg.media:
-            # حفظ الميديا (نستخدم الـ file_id أو نحفظها كـ bytes في الـ JSON إذا كانت صغيرة، 
-            # لكن الأفضل في Telethon هو حفظ الـ media object نفسه أو الـ file_id)
-            # للتبسيط وضمان العمل سنستخدم الـ media object مباشرة في الذاكرة ونحدث الـ JSON
-            # ملاحظة: في Telethon، الـ media object يمكن حفظه وإعادة إرساله
-            
-            # سنقوم بتحميل الميديا وحفظها كـ bytes في ملف منفصل أو داخل الـ JSON (كـ hex)
-            # لضمان استمرارية العمل بعد إعادة التشغيل:
-            file_data = await client.download_media(target_msg.media, file=bytes)
-            db["media"][word] = file_data.hex()
-            save_db()
-            
-            done = await response.reply(f"✅ تم حفظ ال{media_type} بنجاح للكلمة: ({word})")
-            last_actions[done.id] = ("media", word, event.id)
-        else:
-            await response.reply("❌ خطأ: الرسالة لا تحتوي على ميديا.")
-            
-    except asyncio.TimeoutError:
-        await event.reply("⌛ انتهى الوقت، يرجى المحاولة مرة أخرى.")
-    except Exception as e:
-        print(f"Media Add Error: {e}")
-        await event.reply(f"❌ حدث خطأ أثناء الحفظ: {e}")
-
-# =========================
 # 7. الحذف الذكي
 # =========================
 
@@ -181,28 +130,22 @@ async def delete_action(event):
         
         if action_type == "text":
             db["responses"].pop(key, None)
-        elif action_type == "media":
-            db["media"].pop(key, None)
-        
         save_db()
         
-        # حذف السجل
         del last_actions[reply_msg.id]
         
-        # حذف الرسائل (رسالة الحذف، رسالة تأكيد البوت، رسالة المستخدم الأصلية)
         try:
             await client.delete_messages(event.chat_id, [event.id, reply_msg.id, original_user_msg_id])
-            # إرسال تأكيد مؤقت ثم حذفه
             confirm = await event.respond(f"🗑️ تم حذف الرد الخاص بـ ({key}) بنجاح.")
             await asyncio.sleep(3)
             await confirm.delete()
         except:
             pass
     else:
-        await event.reply("❌ لم يتم العثور على هذه العملية في السجلات الأخيرة أو أنها حذفت بالفعل.")
+        await event.reply("❌ لم يتم العثور على هذه العملية.")
 
 # =========================
-# 8. المنشن الجماعي (all)
+# 8. المنشن الجماعي
 # =========================
 
 @client.on(events.NewMessage(pattern=r'(?i)^all(?:\s+(.*))?'))
@@ -222,51 +165,67 @@ async def mention_all(event):
         await asyncio.sleep(0.5)
 
 # =========================
-# 9. معالج الرسائل العام (الردود + الإحصائيات)
+# 9. معالج الرسائل
 # =========================
 
 @client.on(events.NewMessage)
 async def global_handler(event):
-    if not event.text or event.out: return
+    if not event.text or event.out:
+        return
     
     user_id = str(event.sender_id)
     text = event.text.strip()
     
     # تحديث الإحصائيات
     db["stats"][user_id] = db["stats"].get(user_id, 0) + 1
-    # حفظ دوري (اختياري، هنا نحفظ عند كل رسالة لضمان عدم الضياع)
-    # save_db() 
     
-    # ميزة الملف الشخصي (ا)
+    # =========================
+    # أمر (ا) - الملف الشخصي
+    # =========================
+    
     if text == "ا":
+        user = await event.get_sender()
         count = db["stats"].get(user_id, 0)
-        caption = f"✨ **ملفك الشخصي** ✨\n\n✉️ عدد رسائلك: `{count}`"
+
+        # الترتيب
+        sorted_users = sorted(db["stats"].items(), key=lambda x: x[1], reverse=True)
+        rank = next((i+1 for i, u in enumerate(sorted_users) if u[0] == user_id), "غير معروف")
+
+        # تاريخ الانضمام
         try:
-            photo = await client.download_profile_photo(event.sender_id, file=bytes)
+            full = await client.get_participant(event.chat_id, event.sender_id)
+            join_date = full.date.strftime("%Y-%m-%d")
+        except:
+            join_date = "غير معروف"
+
+        caption = (
+            f"✨ ملفك الشخصي ✨\n\n"
+            f"👤 الاسم: {user.first_name}\n"
+            f"✉️ عدد رسائلك: {count}\n"
+            f"🏆 ترتيبك في المتفاعلين: {rank}\n"
+            f"📅 تاريخ انضمامك: {join_date}\n\n"
+            f"استمر في التفاعل لرفع ترتيبك! ✨"
+        )
+
+        try:
+            photo = await client.download_profile_photo(user.id)
             if photo:
                 await client.send_file(event.chat_id, photo, caption=caption)
             else:
                 await event.reply(caption)
         except:
             await event.reply(caption)
+
         return
 
-    # الردود النصية
+    # الردود التلقائية
     if text in db["responses"]:
         await event.reply(db["responses"][text])
         return
-
-    # ردود الميديا
-    if text in db["media"]:
-        try:
-            file_data = bytes.fromhex(db["media"][text])
-            await client.send_file(event.chat_id, file_data, reply_to=event.id)
-        except Exception as e:
-            print(f"Send Media Error: {e}")
 
 # =========================
 # 10. تشغيل البوت
 # =========================
 
-print("🚀 البوت النهائي يعمل الآن بنجاح وبثبات...")
+print("🚀 البوت يعمل الآن...")
 client.run_until_disconnected()
