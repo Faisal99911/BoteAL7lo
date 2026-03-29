@@ -77,7 +77,7 @@ async def welcome(event):
         user = await event.get_user()
 
         welcome_text = (
-            f"اهلاً بك [{user.first_name}](tg://user?id={user.id}) 🙋🏻‍♂️\n\n"
+            f"اهلاً بك في فجر جديد [{user.first_name}](tg://user?id={user.id}) 🙋🏻‍♂️\n\n"
             "خطوة صغيرة اليوم… تصنع فرق كبير غدًا 🌅\n\n"
             "• ممنوع السلبية أو إحباط الآخرين ❌\n"
             "• لا يُسمح بأي محتوى غير لائق 🚫\n"
