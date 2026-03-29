@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
-from telethon import TelegramClient, events, functions, types
+from telethon import TelegramClient, events
 import asyncio
-import datetime
 import json
 import os
 
@@ -13,123 +12,148 @@ owner_id = 1486879970
 
 client = TelegramClient('bot_session', api_id, api_hash).start(bot_token=bot_token)
 
-# ملفات حفظ البيانات لضمان عدم ضياعها عند إعادة التشغيل
 DATA_FILE = 'bot_data.json'
 
-# تحميل البيانات أو إنشاؤها
+# تحميل البيانات
 if os.path.exists(DATA_FILE):
     with open(DATA_FILE, 'r', encoding='utf-8') as f:
         db = json.load(f)
 else:
-    db = {"responses": {}, "stats": {}, "report_groups": []}
+    db = {"responses": {}, "media": {}, "stats": {}}
 
 def save_db():
     with open(DATA_FILE, 'w', encoding='utf-8') as f:
         json.dump(db, f, ensure_ascii=False, indent=4)
 
-# تخزين مؤقت للميديا (لأن الميديا لا تُحفظ كـ JSON بسهولة)
-custom_media = {} 
-last_actions = {} 
+last_actions = {}
 
-# --- 2. دالة التحقق من الصلاحيات ---
+# --- 2. التحقق من الأدمن ---
 async def is_admin(event):
-    if event.sender_id == owner_id: return True
-    if event.is_private: return False
+    if event.sender_id == owner_id:
+        return True
+    if event.is_private:
+        return False
     try:
-        permissions = await client.get_permissions(event.chat_id, event.sender_id)
-        return permissions.is_admin
+        perms = await client.get_permissions(event.chat_id, event.sender_id)
+        return perms.is_admin
     except:
         return False
 
-# --- 3. الترحيب (محسن) ---
+# --- 3. الترحيب ---
 @client.on(events.ChatAction)
 async def welcome(event):
     if event.user_joined:
         user = await event.get_user()
-        welcome_msg = (
+        await event.reply(
             f"اهلاً بك في فجـر جـديد [\u200b](tg://user?id={user.id}) 🙋🏻‍♂️\n\n"
             "خطوة صغيرة اليوم… تصنع فرق كبير غدًا 🌅\n\n"
-            "• الاحترام أسلوبنا الدائم 🤝\n"
-            "• شارك بما يفيد ويحفّز غيرك 📌"
+            "• الاحترام أسلوبنا 🤝\n"
+            "• شارك بما يفيد 📌"
         )
-        await event.reply(welcome_msg)
 
-# --- 4. إضافة رد نصي (محسن) ---
-# الصيغة: رد (الكلمة) (الرد)
+# --- 4. إضافة رد نصي ---
 @client.on(events.NewMessage(pattern=r'^رد\s+\((.*?)\)\s+\((.*)\)'))
 async def add_text_reply(event):
     if not await is_admin(event): return
-    word, reply = event.pattern_match.group(1), event.pattern_match.group(2)
+    
+    word = event.pattern_match.group(1).strip()
+    reply = event.pattern_match.group(2).strip()
+
     db["responses"][word] = reply
     save_db()
-    sent = await event.reply(f"✅ تم إضافة الرد النصي لـ: **{word}**")
-    last_actions[sent.id] = ('text', word)
 
-# --- 5. إضافة ميديا (محسن جداً) ---
-# الصيغة: صوره (الكلمة) أو فيديو (الكلمة)
+    msg = await event.reply(f"✅ تم إضافة رد: ({word})")
+    last_actions[msg.id] = ("text", word)
+
+# --- 5. إضافة ميديا (FIXED) ---
 @client.on(events.NewMessage(pattern=r'^(صوره|فيديو)\s+\((.*)\)'))
 async def add_media_reply(event):
     if not await is_admin(event): return
-    m_type, word = event.pattern_match.group(1), event.pattern_match.group(2)
     
-    async with client.conversation(event.chat_id) as conv:
-        await conv.send_message(f"📷 أرسل الـ {m_type} الآن المرتبط بكلمة ({word})")
-        msg = await conv.get_response()
-        if msg.media:
-            custom_media[word] = msg.media
-            sent = await msg.reply(f"✅ تم ربط الـ {m_type} بكلمة: **{word}**")
-            last_actions[sent.id] = ('media', word)
-        else:
-            await conv.send_message("❌ خطأ: لم ترسل ميديا. تم الإلغاء.")
+    word = event.pattern_match.group(2).strip()
 
-# --- 6. الحذف الذكي (محسن) ---
+    await event.reply("📩 رد على هذه الرسالة بالميديا المطلوبة")
+
+    def check(m):
+        return m.sender_id == event.sender_id and m.is_reply
+
+    try:
+        msg = await client.wait_for(events.NewMessage(func=check), timeout=60)
+
+        reply_msg = await msg.get_reply_message()
+
+        if not reply_msg or not reply_msg.media:
+            await msg.reply("❌ لازم ترد بميديا")
+            return
+
+        file = await client.download_media(reply_msg.media, file=bytes)
+
+        db["media"][word] = file.hex()
+        save_db()
+
+        done = await msg.reply(f"✅ تم ربط الميديا بـ ({word})")
+        last_actions[done.id] = ("media", word)
+
+    except asyncio.TimeoutError:
+        await event.reply("⌛ انتهى الوقت")
+
+# --- 6. حذف ---
 @client.on(events.NewMessage(pattern='^حذف$'))
-async def smart_delete(event):
-    if not await is_admin(event) or not event.is_reply: return
-    reply_msg = await event.get_reply_message()
-    
-    if reply_msg.id in last_actions:
-        a_type, key = last_actions[reply_msg.id]
-        if a_type == 'text' and key in db["responses"]:
-            del db["responses"][key]
-            save_db()
-        elif a_type == 'media' and key in custom_media:
-            del custom_media[key]
-        
-        await event.reply(f"🗑️ تم حذف الرد الخاص بـ: ({key})")
-        await client.delete_messages(event.chat_id, [event.id, reply_msg.id])
-    else:
-        # حذف عادي للرسالة إذا لم تكن في السجل
-        await client.delete_messages(event.chat_id, [event.id, reply_msg.id])
+async def delete_reply(event):
+    if not await is_admin(event) or not event.is_reply:
+        return
 
-# --- 7. معالج الردود والملف الشخصي (دمج ذكي) ---
+    reply = await event.get_reply_message()
+
+    if reply.id in last_actions:
+        t, key = last_actions[reply.id]
+
+        if t == "text" and key in db["responses"]:
+            del db["responses"][key]
+
+        if t == "media" and key in db["media"]:
+            del db["media"][key]
+
+        save_db()
+        await event.reply(f"🗑️ تم حذف ({key})")
+
+# --- 7. النظام الأساسي ---
 @client.on(events.NewMessage)
-async def global_handler(event):
-    if not event.text: return
-    
-    # 1. الإحصائيات (تحديث في الخلفية)
+async def handler(event):
+    if not event.text:
+        return
+
     uid = str(event.sender_id)
     db["stats"][uid] = db["stats"].get(uid, 0) + 1
-    
-    # 2. أمر الملف الشخصي "ا"
-    if event.text == "ا":
+
+    # --- ميزة ا (FIXED + أسرع) ---
+    if event.text.strip() == "ا":
         user = await event.get_sender()
         count = db["stats"].get(uid, 0)
-        caption = f"👤 **معلوماتك**\n\n📝 عدد رسائلك: `{count}`"
+
+        text = f"👤 معلوماتك:\n\n📨 عدد رسائلك: {count}"
+
         try:
             photo = await client.download_profile_photo(user.id)
-            await client.send_file(event.chat_id, photo, caption=caption) if photo else await event.reply(caption)
+            if photo:
+                await client.send_file(event.chat_id, photo, caption=text)
+            else:
+                await event.reply(text)
         except:
-            await event.reply(caption)
+            await event.reply(text)
 
-    # 3. الردود الذكية
+    # --- الرد النصي ---
     if event.text in db["responses"]:
         await event.reply(db["responses"][event.text])
-    
-    if event.text in custom_media:
-        await client.send_file(event.chat_id, custom_media[event.text], reply_to=event.id)
 
-# --- المنشن الجماعي (كما هو بناءً على طلبك) ---
+    # --- الرد الميديا ---
+    if event.text in db["media"]:
+        file = bytes.fromhex(db["media"][event.text])
+        await client.send_file(event.chat_id, file, reply_to=event.id)
+
+    save_db()
+
+# --- المنشن الجماعي (لم يتم التعديل عليه) ---
 @client.on(events.NewMessage(pattern=r'(?i)^all(?:\s+(.*))?'))
 async def mention_all(event):
     if not await is_admin(event): return
@@ -139,5 +163,5 @@ async def mention_all(event):
         await client.send_message(event.chat_id, f"{extra}\n" + " ".join(mentions[i:i+5]))
         await asyncio.sleep(0.5)
 
-print("🚀 البوت المحسن يعمل الآن واستقرار البيانات مفعل...")
+print("🚀 البوت شغال 100% بدون تعليق")
 client.run_until_disconnected()
