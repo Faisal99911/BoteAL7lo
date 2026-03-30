@@ -114,7 +114,6 @@ async def add_text_reply(event):
     save_db()
     
     m = await event.reply(f"✅ تمت إضافة الرد بنجاح\nالكلمة: ({word})\nالرد: ({reply})")
-    # تعديل التخزين ليعتمد على (chat_id, message_id)
     last_actions[(event.chat_id, m.id)] = ("text", word, event.id)
 
 # =========================
@@ -153,8 +152,8 @@ async def media_receiver(event):
         del waiting_for_media[event.sender_id]
         
         m = await event.reply(f"تمت اضافة الـ {media_type} بنجاح ✅")
-        # تعديل التخزين ليعتمد على (chat_id, message_id)
-        last_actions[(event.chat_id, m.id)] = ("media", word, original_cmd_id)
+        # تعديل التخزين ليشمل معرف رسالة الوسائط (event.id)
+        last_actions[(event.chat_id, m.id)] = ("media", word, original_cmd_id, event.id)
 
 # =========================
 # 7. تعديل رسائل
@@ -211,11 +210,16 @@ async def delete_action(event):
     
     reply_msg = await event.get_reply_message()
     
-    # تعديل الحذف ليعتمد على (chat_id, message_id)
     key_id = (event.chat_id, reply_msg.id)
 
     if key_id in last_actions:
-        action_type, key, original_user_msg_id = last_actions[key_id]
+        # تعديل استخراج البيانات ليشمل media_msg_id
+        data = last_actions[key_id]
+        
+        action_type = data[0]
+        key = data[1]
+        original_user_msg_id = data[2]
+        media_msg_id = data[3] if len(data) > 3 else None
         
         if action_type == "text":
             db["responses"].pop(key, None)
@@ -223,11 +227,17 @@ async def delete_action(event):
             db["media"].pop(key, None)
             
         save_db()
-        # تعديل الحذف ليعتمد على (chat_id, message_id)
         del last_actions[key_id]
         
         try:
-            await client.delete_messages(event.chat_id, [event.id, reply_msg.id, original_user_msg_id])
+            # تعديل قائمة الرسائل المراد حذفها
+            to_delete = [event.id, reply_msg.id, original_user_msg_id]
+            
+            if media_msg_id:
+                to_delete.append(media_msg_id)
+                
+            await client.delete_messages(event.chat_id, to_delete)
+            
             confirm = await event.respond(f"🗑️ تم حذف الرد الخاص بـ ({key}) بنجاح.")
             await asyncio.sleep(3)
             await confirm.delete()
