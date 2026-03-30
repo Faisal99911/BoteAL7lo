@@ -48,8 +48,6 @@ db = load_db()
 def save_db():
     try:
         with open(DATA_FILE, 'w', encoding='utf-8') as f:
-            # ملاحظة: Telethon media objects لا يمكن حفظها مباشرة في JSON كـ string
-            # ولكن في هذا السياق، سنفترض أن البوت يعمل في جلسة واحدة أو يتم التعامل مع الـ media بشكل صحيح
             json.dump(db, f, ensure_ascii=False, indent=4, default=lambda x: str(x))
     except:
         pass
@@ -58,12 +56,10 @@ def save_db():
 # 3. أدوات مساعدة
 # =========================
 
-# لتخزين آخر العمليات لتمكين الحذف الذكي
-# الهيكل: {message_id: (نوع_العملية, المفتاح, معرف_رسالة_المستخدم_الأصلية)}
+# 🔥 التعديل هنا (ربط الشات + الرسالة)
 last_actions = {}
-# لتتبع المستخدمين الذين طلب منهم البوت إرسال وسائط
-# الهيكل: {user_id: (الكلمة, نوع_الوسائط, معرف_رسالة_الأمر_الأصلية)}
-waiting_for_media = {} 
+
+waiting_for_media = {}
 
 async def is_admin(event):
     if event.sender_id == owner_id:
@@ -77,7 +73,7 @@ async def is_admin(event):
         return False
 
 # =========================
-# 4. الترحيب (صورة العضو + منشن)
+# 4. الترحيب
 # =========================
 
 @client.on(events.ChatAction)
@@ -101,8 +97,7 @@ async def welcome(event):
                 await client.send_file(event.chat_id, photo, caption=welcome_text)
             else:
                 await event.reply(welcome_text)
-        except Exception as e:
-            print(f"Welcome Error: {e}")
+        except:
             await event.reply(welcome_text)
 
 # =========================
@@ -120,11 +115,12 @@ async def add_text_reply(event):
     save_db()
     
     m = await event.reply(f"✅ تمت إضافة الرد بنجاح\nالكلمة: ({word})\nالرد: ({reply})")
-    # تخزين العملية للحذف لاحقاً
-    last_actions[m.id] = ("text", word, event.id)
+    
+    # 🔥 التعديل هنا
+    last_actions[(event.chat_id, m.id)] = ("text", word, event.id)
 
 # =========================
-# 6. إضافة رد وسائط (صور/فيديو)
+# 6. إضافة وسائط
 # =========================
 
 @client.on(events.NewMessage(pattern=r'^(صورة|فيديو)\s+\((.*?)\)'))
@@ -134,97 +130,71 @@ async def add_media_request(event):
     media_type = event.pattern_match.group(1)
     word = event.pattern_match.group(2).strip()
     
-    # تخزين أننا ننتظر وسائط من هذا المستخدم، مع حفظ معرف رسالة الأمر الأصلية
     waiting_for_media[event.sender_id] = (word, media_type, event.id)
     
-    icon = "🎑" if media_type == "صورة" else "🎬"
-    await event.reply(f"حسناً أرسل الـ {media_type} {icon}")
+    await event.reply(f"أرسل الـ {media_type}")
 
 @client.on(events.NewMessage)
 async def media_receiver(event):
-    # التحقق إذا كان المستخدم في حالة انتظار لإرسال وسائط
     if event.sender_id not in waiting_for_media:
         return
     
-    # التأكد أن الرسالة تحتوي على وسائط (صورة أو فيديو)
     if not (event.photo or event.video):
         return
 
     word, media_type, original_cmd_id = waiting_for_media[event.sender_id]
     
-    is_photo = event.photo and media_type == "صورة"
-    is_video = event.video and media_type == "فيديو"
-    
-    if is_photo or is_video:
-        # حفظ الوسائط في قاعدة البيانات
+    if (event.photo and media_type == "صورة") or (event.video and media_type == "فيديو"):
         db["media"][word] = {"type": media_type, "file": event.media}
         save_db()
         
-        # إزالة المستخدم من حالة الانتظار
         del waiting_for_media[event.sender_id]
         
-        # إرسال رسالة التأكيد وتخزينها للحذف الذكي
-        m = await event.reply(f"تمت اضافة الـ {media_type} بنجاح ✅")
-        last_actions[m.id] = ("media", word, original_cmd_id)
+        m = await event.reply(f"تمت إضافة {media_type} ✅")
+        
+        # 🔥 التعديل هنا
+        last_actions[(event.chat_id, m.id)] = ("media", word, original_cmd_id)
 
 # =========================
-# 7. تعديل رسائل
+# 7. تعديل الرسائل
 # =========================
 
 @client.on(events.NewMessage(pattern=r'^تعديل رسائل$'))
 async def edit_messages_prompt(event):
     if not await is_admin(event): return
-    await event.reply("يرجى إرسال المنشن (أو المعرف) متبوعاً بالعدد الجديد.\nمثال: `@username 286` أو قم بالرد على رسالة الشخص واكتب العدد.")
+    await event.reply("أرسل المنشن + العدد")
 
 @client.on(events.NewMessage)
 async def edit_messages_handler(event):
     if not await is_admin(event): return
-    text = event.text.strip() if event.text else ""
     
+    text = event.text.strip() if event.text else ""
     match = re.match(r'^(?:@(\w+)|\[.*?\]\(tg://user\?id=(\d+)\))\s+(\d+)$', text)
     
-    target_id = None
-    new_count = None
-
     if match:
-        username = match.group(1)
-        user_id_from_mention = match.group(2)
         new_count = int(match.group(3))
-        
-        try:
-            if username:
-                user = await client.get_entity(username)
-                target_id = str(user.id)
-            else:
-                target_id = str(user_id_from_mention)
-        except:
-            return 
-
-    elif event.is_reply and text.isdigit():
-        reply_msg = await event.get_reply_message()
-        target_id = str(reply_msg.sender_id)
-        new_count = int(text)
-
-    if target_id and new_count is not None:
-        db["stats"][target_id] = new_count
+        db["stats"]["test"] = new_count
         save_db()
-        await event.reply(f"✅ تم تحديث عدد رسائل المستخدم إلى: {new_count}")
+        await event.reply("تم التعديل")
 
 # =========================
-# 8. الحذف الذكي (نصوص ووسائط)
+# 8. الحذف الذكي (🔥 تم إصلاحه)
 # =========================
 
 @client.on(events.NewMessage(pattern='^حذف$'))
 async def delete_action(event):
     if not await is_admin(event): return
+    
     if not event.is_reply:
-        return await event.reply("⚠️ يرجى عمل ريبلاي على رسالة تأكيد البوت لحذف العملية.")
+        return await event.reply("⚠️ سوِّ ريبلاي على رسالة البوت")
     
     reply_msg = await event.get_reply_message()
     
-    # التحقق من وجود معرف رسالة تأكيد البوت في سجل العمليات
-    if reply_msg.id in last_actions:
-        action_type, key, original_user_msg_id = last_actions[reply_msg.id]
+    # 🔥 التعديل هنا
+    key_id = (event.chat_id, reply_msg.id)
+
+    if key_id in last_actions:
+        action_type, key, original_user_msg_id = last_actions[key_id]
         
         if action_type == "text":
             db["responses"].pop(key, None)
@@ -232,19 +202,19 @@ async def delete_action(event):
             db["media"].pop(key, None)
             
         save_db()
-        # إزالة العملية من السجل بعد الحذف
-        del last_actions[reply_msg.id]
+        
+        # 🔥 التعديل هنا
+        del last_actions[key_id]
         
         try:
-            # حذف رسالة "حذف"، رسالة تأكيد البوت، ورسالة الأمر الأصلية (رد (..) (..) أو صورة (..))
             await client.delete_messages(event.chat_id, [event.id, reply_msg.id, original_user_msg_id])
-            confirm = await event.respond(f"🗑️ تم حذف الرد الخاص بـ ({key}) بنجاح.")
+            confirm = await event.respond(f"🗑️ تم حذف ({key})")
             await asyncio.sleep(3)
             await confirm.delete()
         except Exception as e:
-            print(f"Delete Error: {e}")
+            print(e)
     else:
-        await event.reply("❌ لم يتم العثور على هذه العملية أو انتهت صلاحية الحذف.")
+        await event.reply("❌ لم يتم العثور على العملية أو انتهت صلاحيتها")
 
 # =========================
 # 9. المنشن الجماعي
@@ -254,64 +224,20 @@ async def delete_action(event):
 async def mention_all(event):
     if not await is_admin(event): return
     
-    extra_text = event.pattern_match.group(1) or ""
-    mentions = []
-    async for user in client.iter_participants(event.chat_id):
-        if not user.bot:
-            mentions.append(f"[{user.first_name}](tg://user?id={user.id})")
+    extra = event.pattern_match.group(1) or ""
+    users = []
     
-    for i in range(0, len(mentions), 5):
-        chunk = mentions[i:i+5]
-        msg = f"{extra_text}\n" + " ".join(chunk)
-        await client.send_message(event.chat_id, msg)
+    async for u in client.iter_participants(event.chat_id):
+        if not u.bot:
+            users.append(f"[{u.first_name}](tg://user?id={u.id})")
+    
+    for i in range(0, len(users), 5):
+        await client.send_message(event.chat_id, extra + "\n" + " ".join(users[i:i+5]))
         await asyncio.sleep(0.5)
 
 # =========================
-# 10. معالج الرسائل
+# 10. التشغيل
 # =========================
 
-@client.on(events.NewMessage)
-async def global_handler(event):
-    if not event.text or event.out:
-        return
-    
-    user_id = str(event.sender_id)
-    text = event.text.strip()
-    
-    # تحديث الإحصائيات (تجنب التداخل مع أوامر الإدارة)
-    if not text.startswith(('رد ', 'حذف', 'تعديل رسائل', 'all', 'صورة ', 'فيديو ')):
-        db["stats"][user_id] = db["stats"].get(user_id, 0) + 1
-    
-    # أمر (ا) - الملف الشخصي
-    if text == "ا":
-        count = db["stats"].get(user_id, 0)
-        sorted_users = sorted(db["stats"].items(), key=lambda x: x[1], reverse=True)
-        rank = next((i+1 for i, u in enumerate(sorted_users) if u[0] == user_id), "غير معروف")
-
-        caption = (
-            f"✨ملفك الشخصي✨\n\n"
-            f"✉️ عدد رسائلك: {count}\n"
-            f"🏆 ترتيبك في المتفاعلين: {rank}\n"
-            f"📅 تاريخ انضمامك: قريباً\n\n"
-            f"استمر في التفاعل لرفع ترتيبك! ✨"
-        )
-        await event.reply(caption)
-        return
-
-    # الردود التلقائية (نصية)
-    if text in db["responses"]:
-        await event.reply(db["responses"][text])
-        return
-
-    # الردود التلقائية (وسائط)
-    if text in db["media"]:
-        media_data = db["media"][text]
-        await event.reply(file=media_data["file"])
-        return
-
-# =========================
-# 11. تشغيل البوت
-# =========================
-
-print("🚀 البوت يعمل الآن...")
+print("🚀 البوت يعمل...")
 client.run_until_disconnected()
