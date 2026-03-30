@@ -52,10 +52,9 @@ def save_db():
 # 3. أدوات مساعدة
 # =========================
 
+# لتخزين آخر العمليات لتمكين الحذف الذكي
+# الهيكل: {message_id: (نوع_العملية, المفتاح, معرف_رسالة_المستخدم)}
 last_actions = {}
-
-if "media" in db:
-    del db["media"]
 
 async def is_admin(event):
     if event.sender_id == owner_id:
@@ -98,7 +97,7 @@ async def welcome(event):
             await event.reply(welcome_text)
 
 # =========================
-# 5. إضافة رد نصي
+# 5. إضافة رد نصي (معدل)
 # =========================
 
 @client.on(events.NewMessage(pattern=r'^رد\s+\((.*?)\)\s+\((.*)\)'))
@@ -112,10 +111,11 @@ async def add_text_reply(event):
     save_db()
     
     m = await event.reply(f"✅ تمت إضافة الرد بنجاح\nالكلمة: ({word})\nالرد: ({reply})")
+    # تخزين العملية للحذف لاحقاً
     last_actions[m.id] = ("text", word, event.id)
 
 # =========================
-# 6. تعديل رسائل (جديد)
+# 6. تعديل رسائل
 # =========================
 
 @client.on(events.NewMessage(pattern=r'^تعديل رسائل$'))
@@ -146,7 +146,7 @@ async def edit_messages_handler(event):
             else:
                 target_id = str(user_id_from_mention)
         except:
-            return # لم يتم العثور على المستخدم
+            return 
 
     elif event.is_reply and text.isdigit():
         reply_msg = await event.get_reply_message()
@@ -159,7 +159,7 @@ async def edit_messages_handler(event):
         await event.reply(f"✅ تم تحديث عدد رسائل المستخدم إلى: {new_count}")
 
 # =========================
-# 7. الحذف الذكي
+# 7. الحذف الذكي (معدل)
 # =========================
 
 @client.on(events.NewMessage(pattern='^حذف$'))
@@ -180,6 +180,7 @@ async def delete_action(event):
         del last_actions[reply_msg.id]
         
         try:
+            # حذف رسالة "حذف"، رسالة تأكيد البوت، ورسالة المستخدم الأصلية (رد (..) (..))
             await client.delete_messages(event.chat_id, [event.id, reply_msg.id, original_user_msg_id])
             confirm = await event.respond(f"🗑️ تم حذف الرد الخاص بـ ({key}) بنجاح.")
             await asyncio.sleep(3)
@@ -187,7 +188,7 @@ async def delete_action(event):
         except:
             pass
     else:
-        await event.reply("❌ لم يتم العثور على هذه العملية.")
+        await event.reply("❌ لم يتم العثور على هذه العملية أو انتهت صلاحية الحذف.")
 
 # =========================
 # 8. المنشن الجماعي
@@ -226,7 +227,7 @@ async def global_handler(event):
         db["stats"][user_id] = db["stats"].get(user_id, 0) + 1
     
     # =========================
-    # أمر (ا) - الملف الشخصي (معدل)
+    # أمر (ا) - الملف الشخصي
     # =========================
     
     if text == "ا":
