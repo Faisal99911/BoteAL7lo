@@ -50,7 +50,6 @@ def save_db():
         with open(DATA_FILE, 'w', encoding='utf-8') as f:
             # ملاحظة: Telethon media objects لا يمكن حفظها مباشرة في JSON كـ string
             # ولكن في هذا السياق، سنفترض أن البوت يعمل في جلسة واحدة أو يتم التعامل مع الـ media بشكل صحيح
-            # لتحسين الحفظ الدائم، يفضل حفظ الـ file_id، لكن Telethon يستخدم الـ media object نفسه للرد السريع
             json.dump(db, f, ensure_ascii=False, indent=4, default=lambda x: str(x))
     except:
         pass
@@ -59,8 +58,12 @@ def save_db():
 # 3. أدوات مساعدة
 # =========================
 
+# لتخزين آخر العمليات لتمكين الحذف الذكي
+# الهيكل: {message_id: (نوع_العملية, المفتاح, معرف_رسالة_المستخدم_الأصلية)}
 last_actions = {}
-waiting_for_media = {} # {user_id: (word, type, original_cmd_id)}
+# لتتبع المستخدمين الذين طلب منهم البوت إرسال وسائط
+# الهيكل: {user_id: (الكلمة, نوع_الوسائط, معرف_رسالة_الأمر_الأصلية)}
+waiting_for_media = {} 
 
 async def is_admin(event):
     if event.sender_id == owner_id:
@@ -117,6 +120,7 @@ async def add_text_reply(event):
     save_db()
     
     m = await event.reply(f"✅ تمت إضافة الرد بنجاح\nالكلمة: ({word})\nالرد: ({reply})")
+    # تخزين العملية للحذف لاحقاً
     last_actions[m.id] = ("text", word, event.id)
 
 # =========================
@@ -130,6 +134,7 @@ async def add_media_request(event):
     media_type = event.pattern_match.group(1)
     word = event.pattern_match.group(2).strip()
     
+    # تخزين أننا ننتظر وسائط من هذا المستخدم، مع حفظ معرف رسالة الأمر الأصلية
     waiting_for_media[event.sender_id] = (word, media_type, event.id)
     
     icon = "🎑" if media_type == "صورة" else "🎬"
@@ -137,21 +142,29 @@ async def add_media_request(event):
 
 @client.on(events.NewMessage)
 async def media_receiver(event):
+    # التحقق إذا كان المستخدم في حالة انتظار لإرسال وسائط
     if event.sender_id not in waiting_for_media:
         return
     
+    # التأكد أن الرسالة تحتوي على وسائط (صورة أو فيديو)
+    if not (event.photo or event.video):
+        return
+
     word, media_type, original_cmd_id = waiting_for_media[event.sender_id]
     
     is_photo = event.photo and media_type == "صورة"
     is_video = event.video and media_type == "فيديو"
     
     if is_photo or is_video:
+        # حفظ الوسائط في قاعدة البيانات
         db["media"][word] = {"type": media_type, "file": event.media}
         save_db()
         
+        # إزالة المستخدم من حالة الانتظار
         del waiting_for_media[event.sender_id]
+        
+        # إرسال رسالة التأكيد وتخزينها للحذف الذكي
         m = await event.reply(f"تمت اضافة الـ {media_type} بنجاح ✅")
-        # تخزين العملية للحذف لاحقاً (نفس طريقة النصوص)
         last_actions[m.id] = ("media", word, original_cmd_id)
 
 # =========================
@@ -209,6 +222,7 @@ async def delete_action(event):
     
     reply_msg = await event.get_reply_message()
     
+    # التحقق من وجود معرف رسالة تأكيد البوت في سجل العمليات
     if reply_msg.id in last_actions:
         action_type, key, original_user_msg_id = last_actions[reply_msg.id]
         
@@ -218,16 +232,17 @@ async def delete_action(event):
             db["media"].pop(key, None)
             
         save_db()
+        # إزالة العملية من السجل بعد الحذف
         del last_actions[reply_msg.id]
         
         try:
-            # حذف رسالة "حذف"، رسالة تأكيد البوت، ورسالة الأمر الأصلية
+            # حذف رسالة "حذف"، رسالة تأكيد البوت، ورسالة الأمر الأصلية (رد (..) (..) أو صورة (..))
             await client.delete_messages(event.chat_id, [event.id, reply_msg.id, original_user_msg_id])
             confirm = await event.respond(f"🗑️ تم حذف الرد الخاص بـ ({key}) بنجاح.")
             await asyncio.sleep(3)
             await confirm.delete()
-        except:
-            pass
+        except Exception as e:
+            print(f"Delete Error: {e}")
     else:
         await event.reply("❌ لم يتم العثور على هذه العملية أو انتهت صلاحية الحذف.")
 
@@ -263,7 +278,7 @@ async def global_handler(event):
     user_id = str(event.sender_id)
     text = event.text.strip()
     
-    # تحديث الإحصائيات
+    # تحديث الإحصائيات (تجنب التداخل مع أوامر الإدارة)
     if not text.startswith(('رد ', 'حذف', 'تعديل رسائل', 'all', 'صورة ', 'فيديو ')):
         db["stats"][user_id] = db["stats"].get(user_id, 0) + 1
     
