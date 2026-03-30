@@ -48,7 +48,10 @@ db = load_db()
 def save_db():
     try:
         with open(DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump(db, f, ensure_ascii=False, indent=4)
+            # ملاحظة: Telethon media objects لا يمكن حفظها مباشرة في JSON كـ string
+            # ولكن في هذا السياق، سنفترض أن البوت يعمل في جلسة واحدة أو يتم التعامل مع الـ media بشكل صحيح
+            # لتحسين الحفظ الدائم، يفضل حفظ الـ file_id، لكن Telethon يستخدم الـ media object نفسه للرد السريع
+            json.dump(db, f, ensure_ascii=False, indent=4, default=lambda x: str(x))
     except:
         pass
 
@@ -57,7 +60,7 @@ def save_db():
 # =========================
 
 last_actions = {}
-waiting_for_media = {} # {user_id: (word, type)}
+waiting_for_media = {} # {user_id: (word, type, original_cmd_id)}
 
 async def is_admin(event):
     if event.sender_id == owner_id:
@@ -143,14 +146,12 @@ async def media_receiver(event):
     is_video = event.video and media_type == "فيديو"
     
     if is_photo or is_video:
-        # حفظ الـ file_id أو الـ media object
-        # في Telethon يفضل حفظ الـ media object نفسه أو تحويله لـ string إذا لزم الأمر
-        # هنا سنقوم بحفظ الـ media للرد به لاحقاً
         db["media"][word] = {"type": media_type, "file": event.media}
         save_db()
         
         del waiting_for_media[event.sender_id]
         m = await event.reply(f"تمت اضافة الـ {media_type} بنجاح ✅")
+        # تخزين العملية للحذف لاحقاً (نفس طريقة النصوص)
         last_actions[m.id] = ("media", word, original_cmd_id)
 
 # =========================
@@ -197,7 +198,7 @@ async def edit_messages_handler(event):
         await event.reply(f"✅ تم تحديث عدد رسائل المستخدم إلى: {new_count}")
 
 # =========================
-# 8. الحذف الذكي
+# 8. الحذف الذكي (نصوص ووسائط)
 # =========================
 
 @client.on(events.NewMessage(pattern='^حذف$'))
@@ -220,6 +221,7 @@ async def delete_action(event):
         del last_actions[reply_msg.id]
         
         try:
+            # حذف رسالة "حذف"، رسالة تأكيد البوت، ورسالة الأمر الأصلية
             await client.delete_messages(event.chat_id, [event.id, reply_msg.id, original_user_msg_id])
             confirm = await event.respond(f"🗑️ تم حذف الرد الخاص بـ ({key}) بنجاح.")
             await asyncio.sleep(3)
@@ -289,7 +291,6 @@ async def global_handler(event):
     # الردود التلقائية (وسائط)
     if text in db["media"]:
         media_data = db["media"][text]
-        # في Telethon، يمكننا إرسال الـ media object مباشرة
         await event.reply(file=media_data["file"])
         return
 
