@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import datetime
+import re
 
 # =========================
 # 1. الإعدادات الأساسية
@@ -114,6 +115,50 @@ async def add_text_reply(event):
     last_actions[m.id] = ("text", word, event.id)
 
 # =========================
+# 6. تعديل رسائل (جديد)
+# =========================
+
+@client.on(events.NewMessage(pattern=r'^تعديل رسائل$'))
+async def edit_messages_prompt(event):
+    if not await is_admin(event): return
+    await event.reply("يرجى إرسال المنشن (أو المعرف) متبوعاً بالعدد الجديد.\nمثال: `@username 286` أو قم بالرد على رسالة الشخص واكتب العدد.")
+
+@client.on(events.NewMessage)
+async def edit_messages_handler(event):
+    if not await is_admin(event): return
+    text = event.text.strip()
+    
+    # التحقق إذا كان النص عبارة عن (يوزر/منشن + رقم) أو (رقم فقط في حال الرد)
+    match = re.match(r'^(?:@(\w+)|\[.*?\]\(tg://user\?id=(\d+)\))\s+(\d+)$', text)
+    
+    target_id = None
+    new_count = None
+
+    if match:
+        username = match.group(1)
+        user_id_from_mention = match.group(2)
+        new_count = int(match.group(3))
+        
+        try:
+            if username:
+                user = await client.get_entity(username)
+                target_id = str(user.id)
+            else:
+                target_id = str(user_id_from_mention)
+        except:
+            return # لم يتم العثور على المستخدم
+
+    elif event.is_reply and text.isdigit():
+        reply_msg = await event.get_reply_message()
+        target_id = str(reply_msg.sender_id)
+        new_count = int(text)
+
+    if target_id and new_count is not None:
+        db["stats"][target_id] = new_count
+        save_db()
+        await event.reply(f"✅ تم تحديث عدد رسائل المستخدم إلى: {new_count}")
+
+# =========================
 # 7. الحذف الذكي
 # =========================
 
@@ -176,46 +221,30 @@ async def global_handler(event):
     user_id = str(event.sender_id)
     text = event.text.strip()
     
-    # تحديث الإحصائيات
-    db["stats"][user_id] = db["stats"].get(user_id, 0) + 1
+    # تحديث الإحصائيات (تجنب التداخل مع أوامر الإدارة)
+    if not text.startswith(('رد ', 'حذف', 'تعديل رسائل', 'all')):
+        db["stats"][user_id] = db["stats"].get(user_id, 0) + 1
     
     # =========================
-    # أمر (ا) - الملف الشخصي
+    # أمر (ا) - الملف الشخصي (معدل)
     # =========================
     
     if text == "ا":
-        user = await event.get_sender()
         count = db["stats"].get(user_id, 0)
 
         # الترتيب
         sorted_users = sorted(db["stats"].items(), key=lambda x: x[1], reverse=True)
         rank = next((i+1 for i, u in enumerate(sorted_users) if u[0] == user_id), "غير معروف")
 
-        # تاريخ الانضمام
-        try:
-            full = await client.get_participant(event.chat_id, event.sender_id)
-            join_date = full.date.strftime("%Y-%m-%d")
-        except:
-            join_date = "غير معروف"
-
         caption = (
-            f"✨ ملفك الشخصي ✨\n\n"
-            f"👤 الاسم: {user.first_name}\n"
+            f"✨ملفك الشخصي✨\n\n"
             f"✉️ عدد رسائلك: {count}\n"
             f"🏆 ترتيبك في المتفاعلين: {rank}\n"
-            f"📅 تاريخ انضمامك: {join_date}\n\n"
+            f"📅 تاريخ انضمامك: قريباً\n\n"
             f"استمر في التفاعل لرفع ترتيبك! ✨"
         )
 
-        try:
-            photo = await client.download_profile_photo(user.id)
-            if photo:
-                await client.send_file(event.chat_id, photo, caption=caption)
-            else:
-                await event.reply(caption)
-        except:
-            await event.reply(caption)
-
+        await event.reply(caption)
         return
 
     # الردود التلقائية
