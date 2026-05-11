@@ -30,6 +30,10 @@ def load_db():
                 data = json.load(f)
                 if "media" not in data:
                     data["media"] = {}
+                if "warnings" not in data:
+                    data["warnings"] = {}
+                if "muted" not in data:
+                    data["muted"] = {}
                 return data
         except:
             return create_empty_db()
@@ -40,6 +44,8 @@ def create_empty_db():
         "responses": {},
         "stats": {},
         "media": {},
+        "warnings": {},
+        "muted": {},
         "meta": {"created": str(datetime.datetime.now())}
     }
 
@@ -57,7 +63,7 @@ def save_db():
 # =========================
 
 last_actions = {}
-waiting_for_media = {} 
+waiting_for_media = {}
 
 async def is_admin(event):
     if event.sender_id == owner_id:
@@ -68,6 +74,39 @@ async def is_admin(event):
         perms = await client.get_permissions(event.chat_id, event.sender_id)
         return perms.is_admin
     except:
+        return False
+
+async def mute_user(chat_id, user_id, hours=6):
+    """كتم مستخدم لمدة محددة بالساعات"""
+    until = datetime.datetime.now() + datetime.timedelta(hours=hours)
+    try:
+        await client(functions.EditBannedRequest(
+            chat_id,
+            user_id,
+            types.ChatBannedRights(
+                until_date=until,
+                send_messages=True
+            )
+        ))
+        return until
+    except Exception as e:
+        print(f"Mute Error: {e}")
+        return None
+
+async def unmute_user(chat_id, user_id):
+    """إلغاء كتم مستخدم"""
+    try:
+        await client(functions.EditBannedRequest(
+            chat_id,
+            user_id,
+            types.ChatBannedRights(
+                until_date=None,
+                send_messages=False
+            )
+        ))
+        return True
+    except Exception as e:
+        print(f"Unmute Error: {e}")
         return False
 
 # =========================
@@ -152,7 +191,6 @@ async def media_receiver(event):
         del waiting_for_media[event.sender_id]
         
         m = await event.reply(f"تمت اضافة الـ {media_type} بنجاح ✅")
-        # تعديل التخزين ليشمل معرف رسالة الوسائط (event.id)
         last_actions[(event.chat_id, m.id)] = ("media", word, original_cmd_id, event.id)
 
 # =========================
@@ -213,7 +251,6 @@ async def delete_action(event):
     key_id = (event.chat_id, reply_msg.id)
 
     if key_id in last_actions:
-        # تعديل استخراج البيانات ليشمل media_msg_id
         data = last_actions[key_id]
         
         action_type = data[0]
@@ -230,7 +267,6 @@ async def delete_action(event):
         del last_actions[key_id]
         
         try:
-            # تعديل قائمة الرسائل المراد حذفها
             to_delete = [event.id, reply_msg.id, original_user_msg_id]
             
             if media_msg_id:
@@ -267,7 +303,180 @@ async def mention_all(event):
         await asyncio.sleep(0.5)
 
 # =========================
-# 10. معالج الرسائل
+# 10. الكتم والإنذار
+# =========================
+
+@client.on(events.NewMessage(pattern=r'^كتم$'))
+async def mute_command(event):
+    if not await is_admin(event): return
+    if not event.is_reply:
+        return await event.reply("⚠️ يرجى الرد على رسالة المستخدم المراد كتمه.")
+
+    from telethon.tl import functions
+    reply_msg = await event.get_reply_message()
+    user = await reply_msg.get_sender()
+    user_id = str(user.id)
+    chat_id = event.chat_id
+
+    until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=6)
+
+    try:
+        await client(functions.channels.EditBannedRequest(
+            chat_id,
+            user.id,
+            types.ChatBannedRights(
+                until_date=until,
+                send_messages=True
+            )
+        ))
+
+        db["muted"][user_id] = str(until)
+        save_db()
+
+        await event.reply(
+            f"🔇 تم كتم [{user.first_name}](tg://user?id={user.id}) لمدة 6 ساعات.",
+            parse_mode='md'
+        )
+
+        await asyncio.sleep(6 * 3600)
+
+        # رفع الكتم تلقائياً بعد 6 ساعات إذا لم يُرفع يدوياً
+        if user_id in db["muted"]:
+            await client(functions.channels.EditBannedRequest(
+                chat_id,
+                user.id,
+                types.ChatBannedRights(until_date=None, send_messages=False)
+            ))
+            db["muted"].pop(user_id, None)
+            save_db()
+
+    except Exception as e:
+        await event.reply(f"❌ فشل الكتم: {e}")
+
+
+@client.on(events.NewMessage(pattern=r'^انذار$'))
+async def warn_command(event):
+    if not await is_admin(event): return
+    if not event.is_reply:
+        return await event.reply("⚠️ يرجى الرد على رسالة المستخدم المراد إنذاره.")
+
+    from telethon.tl import functions
+    reply_msg = await event.get_reply_message()
+    user = await reply_msg.get_sender()
+    user_id = str(user.id)
+    chat_id = event.chat_id
+
+    current_warnings = db["warnings"].get(user_id, 0) + 1
+    db["warnings"][user_id] = current_warnings
+    save_db()
+
+    if current_warnings == 1:
+        await event.reply(
+            f"⚠️ إنذار 1/2 لـ [{user.first_name}](tg://user?id={user.id})\n"
+            f"تحذير: إنذار آخر سيؤدي إلى كتمك 6 ساعات!",
+            parse_mode='md'
+        )
+
+    elif current_warnings >= 2:
+        # كتم المستخدم
+        until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=6)
+        try:
+            await client(functions.channels.EditBannedRequest(
+                chat_id,
+                user.id,
+                types.ChatBannedRights(
+                    until_date=until,
+                    send_messages=True
+                )
+            ))
+
+            db["muted"][user_id] = str(until)
+            db["warnings"][user_id] = 0  # إعادة تصفير الإنذارات بعد الكتم
+            save_db()
+
+            await event.reply(
+                f"🔇 [{user.first_name}](tg://user?id={user.id}) وصل إلى إنذار 2/2\n"
+                f"تم كتمه تلقائياً لمدة 6 ساعات! 🚫",
+                parse_mode='md'
+            )
+
+            await asyncio.sleep(6 * 3600)
+
+            if user_id in db["muted"]:
+                await client(functions.channels.EditBannedRequest(
+                    chat_id,
+                    user.id,
+                    types.ChatBannedRights(until_date=None, send_messages=False)
+                ))
+                db["muted"].pop(user_id, None)
+                save_db()
+
+        except Exception as e:
+            await event.reply(f"❌ فشل الكتم: {e}")
+
+
+@client.on(events.NewMessage(pattern=r'^الغاء كتم$'))
+async def unmute_by_reply(event):
+    """إلغاء الكتم بالرد على رسالة الشخص المكتوم"""
+    if not await is_admin(event): return
+    if not event.is_reply:
+        return await event.reply("⚠️ يرجى الرد على رسالة المستخدم المراد إلغاء كتمه.")
+
+    from telethon.tl import functions
+    reply_msg = await event.get_reply_message()
+    user = await reply_msg.get_sender()
+    user_id = str(user.id)
+    chat_id = event.chat_id
+
+    try:
+        await client(functions.channels.EditBannedRequest(
+            chat_id,
+            user.id,
+            types.ChatBannedRights(until_date=None, send_messages=False)
+        ))
+
+        db["muted"].pop(user_id, None)
+        save_db()
+
+        await event.reply(
+            f"✅ تم إلغاء كتم [{user.first_name}](tg://user?id={user.id}) بنجاح.",
+            parse_mode='md'
+        )
+    except Exception as e:
+        await event.reply(f"❌ فشل إلغاء الكتم: {e}")
+
+
+@client.on(events.NewMessage(pattern=r'^الغاء كتم @(\w+)$'))
+async def unmute_by_username(event):
+    """إلغاء الكتم عبر اليوزر مباشرة"""
+    if not await is_admin(event): return
+
+    from telethon.tl import functions
+    username = event.pattern_match.group(1)
+    chat_id = event.chat_id
+
+    try:
+        user = await client.get_entity(username)
+        user_id = str(user.id)
+
+        await client(functions.channels.EditBannedRequest(
+            chat_id,
+            user.id,
+            types.ChatBannedRights(until_date=None, send_messages=False)
+        ))
+
+        db["muted"].pop(user_id, None)
+        save_db()
+
+        await event.reply(
+            f"✅ تم إلغاء كتم [{user.first_name}](tg://user?id={user.id}) بنجاح.",
+            parse_mode='md'
+        )
+    except Exception as e:
+        await event.reply(f"❌ فشل إلغاء الكتم: {e}")
+
+# =========================
+# 11. معالج الرسائل
 # =========================
 
 @client.on(events.NewMessage)
@@ -278,7 +487,7 @@ async def global_handler(event):
     user_id = str(event.sender_id)
     text = event.text.strip()
     
-    if not text.startswith(('رد ', 'حذف', 'تعديل رسائل', 'all', 'صورة ', 'فيديو ')):
+    if not text.startswith(('رد ', 'حذف', 'تعديل رسائل', 'all', 'صورة ', 'فيديو ', 'كتم', 'انذار', 'الغاء كتم')):
         db["stats"][user_id] = db["stats"].get(user_id, 0) + 1
     
     if text == "ا":
@@ -306,7 +515,7 @@ async def global_handler(event):
         return
 
 # =========================
-# 11. تشغيل البوت
+# 12. تشغيل البوت
 # =========================
 
 print("🚀 البوت يعمل الآن...")
