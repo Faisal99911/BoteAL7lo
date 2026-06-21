@@ -246,64 +246,55 @@ async def media_receiver(event):
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-@client.on(events.NewMessage(pattern=r'(?i)^حذف\s+(?:ا|أ)خر\s*([\d٠-٩]+)\s*(?:رساله|رسالة|رسائل)\s*$'))
-async def delete_last_n_messages(event):
+@client.on(events.NewMessage(pattern=r'^تعديل رسائل$'))
+async def edit_messages_prompt(event):
     if not await is_admin(event): return
-    if event.is_private: return
+    await event.reply("يرجى إرسال المنشن (أو المعرف) متبوعاً بالعدد الجديد.\nمثال: `@username 286` أو قم بالرد على رسالة الشخص واكتب العدد.")
 
-    # تحويل الأرقام إلى إنجليزية
-    count_str = normalize_text(event.pattern_match.group(1))
-    count = int(count_str)
+@client.on(events.NewMessage)
+async def edit_messages_handler(event):
+    text = event.text.strip() if event.text else ""
+    if not text:
+        return
 
-    if count <= 0: 
-        return await event.reply("⚠️ العدد يجب أن يكون أكبر من صفر.")
+    # نفحص شكل النص أولاً (بدون أي طلب شبكة) قبل ما نستدعي is_admin،
+    # عشان رسائل عادية كثير زي "ا" أو أي كلام آخر ما تنتظر شبكة بدون فايدة.
+    match = re.match(r'^(?:@(\w+)|\[.*?\]\(tg://user\?id=(\d+)\))\s+(\d+)$', text)
+    is_reply_digit = event.is_reply and text.isdigit()
 
-    count = min(count, 1000)
-    chat_id = event.chat_id
+    if not match and not is_reply_digit:
+        return
 
-    # إرسال رسالة جاري الحذف
-    status_msg = await event.reply(f"🗑️ جاري حذف آخر {count} رسالة...")
-    
-    # نجمع معرفات الرسائل للحذف (ونبدأ برسالة الأمر نفسها)
-    ids_to_delete = [event.id]
+    if not await is_admin(event):
+        return
 
-    try:
-        # المحاولة بالطريقة الرسمية
-        async for msg in client.iter_messages(chat_id, offset_id=event.id, limit=count):
-            ids_to_delete.append(msg.id)
-    except:
-        # الحل البديل للجروبات العادية بالتخمين المتسلسل
-        current_id = event.id
-        for _ in range(count):
-            current_id -= 1
-            if current_id > 0:
-                ids_to_delete.append(current_id)
+    target_id = None
+    new_count = None
 
-    # تنفيذ الحذف الفعلي
-    deleted_total = 0
-    chunk_size = 100
-    for i in range(0, len(ids_to_delete), chunk_size):
-        chunk = ids_to_delete[i:i + chunk_size]
+    if match:
+        username = match.group(1)
+        user_id_from_mention = match.group(2)
+        new_count = int(match.group(3))
+        
         try:
-            await client.delete_messages(chat_id, chunk)
-            deleted_total += len(chunk)
+            if username:
+                user = await client.get_entity(username)
+                target_id = str(user.id)
+            else:
+                target_id = str(user_id_from_mention)
         except:
-            pass
-        await asyncio.sleep(0.3)
+            return 
 
-    # حذف رسالة "جاري الحذف" بعد الانتهاء
-    try:
-        await status_msg.delete()
-    except:
-        pass
+    elif event.is_reply and text.isdigit():
+        reply_msg = await event.get_reply_message()
+        target_id = str(reply_msg.sender_id)
+        new_count = int(text)
 
-    # إرسال رسالة التأكيد وحذفها تلقائياً بعد 3 ثواني
-    try:
-        confirm = await client.send_message(chat_id, f"✅ تم حذف الرسائل بنجاح.")
-        await asyncio.sleep(3)
-        await confirm.delete()
-    except:
-        pass
+    if target_id and new_count is not None:
+        db["stats"][target_id] = new_count
+        save_db()
+        await event.reply(f"✅ تم تحديث عدد رسائل المستخدم إلى: {new_count}")
+
 # ──────────────────────────────────────────────────────────────────────────────
 # =========================
 # القسم 8
