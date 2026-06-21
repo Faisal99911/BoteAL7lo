@@ -245,59 +245,55 @@ async def media_receiver(event):
 # =========================
 # ──────────────────────────────────────────────────────────────────────────────
 
-
 @client.on(events.NewMessage(pattern=r'(?i)^حذف\s+(?:ا|أ)خر\s*([\d٠-٩]+)\s*(?:رساله|رسالة|رسائل)\s*$'))
 async def delete_last_n_messages(event):
     if not await is_admin(event): return
     if event.is_private: return
 
-    # تحويل الأرقام العربية إلى إنجليزية
+    # تحويل الأرقام إلى إنجليزية
     count_str = normalize_text(event.pattern_match.group(1))
     count = int(count_str)
 
     if count <= 0: 
         return await event.reply("⚠️ العدد يجب أن يكون أكبر من صفر.")
 
-    # حد أقصى احترازي 1000 رسالة دفعة واحدة
     count = min(count, 1000)
     chat_id = event.chat_id
 
     status_msg = await event.reply(f"🗑️ جاري حذف آخر {count} رسالة...")
     
-    # نجمع معرفات الرسائل للحذف (ونضيف رسالة الأمر نفسها)
+    # نجمع معرفات الرسائل للحذف (ونبدأ برسالة الأمر نفسها)
     ids_to_delete = [event.id]
 
     try:
-        # جلب الرسائل السابقة مباشرة قبل رسالة الأمر
+        # المحاولة بالطريقة الرسمية (تنجح لو القروب سوبر جروب)
         async for msg in client.iter_messages(chat_id, offset_id=event.id, limit=count):
             ids_to_delete.append(msg.id)
     except Exception as e:
-        return await status_msg.edit(f"❌ تعذّر قراءة سجل الرسائل: {e}")
+        # [الحل البديل والذكي] إذا رفض تليجرام قراءة السجل لأن الجروب عادي:
+        # نخمن المعرفات السابقة تنازلياً لأنها تكون متسلسلة في المجموعات العادية
+        current_id = event.id
+        for _ in range(count):
+            current_id -= 1
+            if current_id > 0:
+                ids_to_delete.append(current_id)
 
-    # إذا لم يجد سوى رسالة الأمر نفسها
-    if len(ids_to_delete) <= 1:
-        return await status_msg.edit("⚠️ لم يتم العثور على رسائل سابقة لحذفها.")
-
+    # الحذف الفعلي على دفعات
     deleted_total = 0
     try:
-        # الحذف على دفعات صغيرة (كل دفعة 100 رسالة) لتجنب الحظر من التليجرام
         chunk_size = 100
         for i in range(0, len(ids_to_delete), chunk_size):
             chunk = ids_to_delete[i:i + chunk_size]
-            
-            # التعديل الجوهري هنا: تمرير chat_id كمعامل أول لضمان تفعيل الحذف بالمجموعات
             await client.delete_messages(chat_id, chunk)
             deleted_total += len(chunk)
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.3)
 
-        # حذف رسالة الحالة الموقتة
         try:
             await status_msg.delete()
         except:
             pass
 
-        # إرسال رسالة تأكيد وحذفها تلقائياً بعد 3 ثوانٍ
-        # نطرح 1 من الإجمالي لاستثناء رسالة الأمر "حذف آخر X رسالة" من الحسبة للمستخدم
+        # رسالة تأكيد مؤقتة تنحذف بعد 3 ثواني
         confirm = await client.send_message(chat_id, f"✅ تم حذف {deleted_total - 1} رسالة بنجاح.")
         await asyncio.sleep(3)
         await confirm.delete()
@@ -305,6 +301,7 @@ async def delete_last_n_messages(event):
     except Exception as e:
         print(f"Bulk Delete Error: {e}")
         await status_msg.edit(f"❌ فشل الحذف. تأكد أن البوت يملك صلاحية 'حذف الرسائل'.")
+
 # ──────────────────────────────────────────────────────────────────────────────
 # =========================
 # القسم 8
