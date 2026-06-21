@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-from telethon import TelegramClient, events, types
+from telethon import TelegramClient, events, types, Button
 from telethon.tl import functions
 import asyncio
 import json
@@ -35,6 +35,8 @@ def load_db():
                     data["warnings"] = {}
                 if "muted" not in data:
                     data["muted"] = {}
+                if "schedules" not in data:
+                    data["schedules"] = {}
                 return data
         except:
             return create_empty_db()
@@ -47,6 +49,7 @@ def create_empty_db():
         "media": {},
         "warnings": {},
         "muted": {},
+        "schedules": {},
         "meta": {"created": str(datetime.datetime.now())}
     }
 
@@ -66,6 +69,11 @@ def save_db():
 last_actions = {}
 waiting_for_media = {}
 bot_id = None
+
+# حالة محادثة جدولة الرسائل: sender_id -> dict بمراحل الإنشاء
+scheduling_state = {}
+# مهام الجدولة الجارية (asyncio tasks) عشان نقدر نلغيها عند الحذف/التعديل
+schedule_tasks = {}
 
 async def get_bot_id():
     global bot_id
@@ -252,6 +260,57 @@ async def delete_action(event):
             print(f"Delete Error: {e}")
     else:
         await event.reply("❌ لم يتم العثور على هذه العملية أو انتهت صلاحية الحذف.")
+
+# =========================
+# 8.ب حذف آخر X رسالة بالقروب
+# =========================
+
+@client.on(events.NewMessage(pattern=r'^حذف اخر\s+(\d+)\s+رساله$|^حذف اخر\s+(\d+)\s+رسالة$'))
+async def delete_last_n_messages(event):
+    if not await is_admin(event): return
+    if event.is_private:
+        return
+
+    count_str = event.pattern_match.group(1) or event.pattern_match.group(2)
+    count = int(count_str)
+
+    if count <= 0:
+        return await event.reply("⚠️ العدد يجب أن يكون أكبر من صفر.")
+
+    # حد أقصى احترازي عشان ما نضغط على حدود تيليجرام
+    count = min(count, 5000)
+
+    chat_id = event.chat_id
+
+    status_msg = await event.reply(f"🗑️ جاري حذف آخر {count} رسالة...")
+
+    # نجمع المعرفات: من رسالة الأمر نفسها للخلف
+    ids_to_delete = []
+    # نضيف رسالة الأمر نفسها ضمن الحذف
+    ids_to_delete.append(event.id)
+
+    async for msg in client.iter_messages(chat_id, offset_id=event.id, limit=count):
+        ids_to_delete.append(msg.id)
+
+    deleted_total = 0
+    try:
+        # الحذف على دفعات (تيليجرام يسمح بحذف عدة رسائل بنفس الاستدعاء، لكن نقسمها احترازاً)
+        chunk_size = 100
+        for i in range(0, len(ids_to_delete), chunk_size):
+            chunk = ids_to_delete[i:i + chunk_size]
+            await client.delete_messages(chat_id, chunk)
+            deleted_total += len(chunk)
+            await asyncio.sleep(0.3)
+
+        await status_msg.delete()
+        confirm = await client.send_message(chat_id, f"✅ تم حذف {deleted_total} رسالة بنجاح.")
+        await asyncio.sleep(3)
+        await confirm.delete()
+    except Exception as e:
+        try:
+            await status_msg.edit(f"❌ حدث خطأ أثناء الحذف: {e}")
+        except:
+            print(f"Bulk Delete Error: {e}")
 
 # =========================
 # 9. المنشن الجماعي
@@ -449,7 +508,205 @@ async def unmute_by_username(event):
         await event.reply(f"❌ فشل إلغاء الكتم: {e}")
 
 # =========================
-# 11. معالج الرسائل
+# 11. جدولة الرسائل (تلقائي يومي)
+# =========================
+# الفكرة:
+#  - أمر "جدولة" يفتح قائمة أزرار: [➕ جدولة جديدة] [📋 عرض الجدولات] [❌ إلغاء جدولة]
+#  - عند "جدولة جديدة": يطلب من المشرف يرسل وقت الإرسال اليومي (مثال: 07:00) ثم نص الرسالة.
+#  - يتم حفظها بقاعدة البيانات ويشتغل لها مؤقّت (loop) يرسل الرسالة كل يوم بنفس الوقت.
+#  - عرض الجدولات يطلع قائمة بأزرار لكل جدولة (تعديل الوقت / حذف).
+
+def schedule_keyboard():
+    return [
+        [Button.inline("➕ جدولة جديدة", b"sched_new")],
+        [Button.inline("📋 عرض الجدولات", b"sched_list")],
+    ]
+
+def schedule_item_keyboard(sched_id):
+    return [
+        [
+            Button.inline("✏️ تعديل الوقت", f"sched_edit_{sched_id}".encode()),
+            Button.inline("🗑️ حذف", f"sched_del_{sched_id}".encode()),
+        ]
+    ]
+
+async def schedule_loop(sched_id):
+    """يرسل الرسالة المجدولة يومياً بنفس الوقت المحدد."""
+    while True:
+        sched = db["schedules"].get(sched_id)
+        if not sched:
+            return  # تم حذفها
+
+        now = datetime.datetime.now()
+        hour, minute = sched["hour"], sched["minute"]
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += datetime.timedelta(days=1)
+
+        wait_seconds = (target - now).total_seconds()
+        await asyncio.sleep(wait_seconds)
+
+        # إعادة التأكد إنها ما انحذفت أثناء الانتظار
+        sched = db["schedules"].get(sched_id)
+        if not sched:
+            return
+
+        try:
+            await client.send_message(int(sched["chat_id"]), sched["text"])
+        except Exception as e:
+            print(f"Schedule Send Error ({sched_id}): {e}")
+
+        # نكمل اللوب لليوم التالي
+
+def start_schedule_task(sched_id):
+    if sched_id in schedule_tasks:
+        schedule_tasks[sched_id].cancel()
+    task = asyncio.create_task(schedule_loop(sched_id))
+    schedule_tasks[sched_id] = task
+
+def stop_schedule_task(sched_id):
+    task = schedule_tasks.pop(sched_id, None)
+    if task:
+        task.cancel()
+
+def restart_all_schedules():
+    for sched_id in list(db["schedules"].keys()):
+        start_schedule_task(sched_id)
+
+
+@client.on(events.NewMessage(pattern=r'^جدولة$'))
+async def schedule_menu(event):
+    if not await is_admin(event): return
+    await event.reply("⏰ قائمة جدولة الرسائل التلقائية:", buttons=schedule_keyboard())
+
+
+@client.on(events.CallbackQuery(data=b"sched_new"))
+async def schedule_new(event):
+    if not await is_admin(event):
+        return await event.answer("ليس لديك صلاحية.", alert=True)
+
+    scheduling_state[event.sender_id] = {
+        "step": "time",
+        "chat_id": event.chat_id,
+    }
+    await event.edit("🕖 أرسل الوقت اليومي للإرسال بصيغة HH:MM (مثال: 07:00)")
+
+
+@client.on(events.CallbackQuery(data=b"sched_list"))
+async def schedule_list(event):
+    if not await is_admin(event):
+        return await event.answer("ليس لديك صلاحية.", alert=True)
+
+    chat_schedules = {
+        sid: s for sid, s in db["schedules"].items()
+        if str(s["chat_id"]) == str(event.chat_id)
+    }
+
+    if not chat_schedules:
+        return await event.edit("لا توجد جدولات حالياً في هذه المجموعة.", buttons=schedule_keyboard())
+
+    await event.edit("📋 الجدولات الحالية:", buttons=schedule_keyboard())
+    for sid, s in chat_schedules.items():
+        preview = s["text"] if len(s["text"]) <= 80 else s["text"][:77] + "..."
+        msg = f"⏰ الوقت: {s['hour']:02d}:{s['minute']:02d}\n📝 الرسالة: {preview}"
+        await client.send_message(
+            event.chat_id, msg, buttons=schedule_item_keyboard(sid)
+        )
+
+
+@client.on(events.CallbackQuery(pattern=rb"^sched_del_(.+)$"))
+async def schedule_delete(event):
+    if not await is_admin(event):
+        return await event.answer("ليس لديك صلاحية.", alert=True)
+
+    sched_id = event.pattern_match.group(1).decode()
+    if sched_id in db["schedules"]:
+        db["schedules"].pop(sched_id, None)
+        save_db()
+        stop_schedule_task(sched_id)
+        await event.edit("🗑️ تم حذف الجدولة بنجاح.")
+    else:
+        await event.edit("❌ لم يتم العثور على هذه الجدولة (ربما حُذفت مسبقاً).")
+
+
+@client.on(events.CallbackQuery(pattern=rb"^sched_edit_(.+)$"))
+async def schedule_edit(event):
+    if not await is_admin(event):
+        return await event.answer("ليس لديك صلاحية.", alert=True)
+
+    sched_id = event.pattern_match.group(1).decode()
+    if sched_id not in db["schedules"]:
+        return await event.edit("❌ لم يتم العثور على هذه الجدولة.")
+
+    scheduling_state[event.sender_id] = {
+        "step": "edit_time",
+        "chat_id": event.chat_id,
+        "sched_id": sched_id,
+    }
+    await event.edit("🕖 أرسل الوقت الجديد بصيغة HH:MM (مثال: 19:30)")
+
+
+@client.on(events.NewMessage)
+async def schedule_conversation_handler(event):
+    """يلتقط الرسائل أثناء عملية إنشاء/تعديل الجدولة (وقت ثم نص)."""
+    if event.sender_id not in scheduling_state:
+        return
+    if not await is_admin(event):
+        return
+
+    state = scheduling_state[event.sender_id]
+    text = event.text.strip() if event.text else ""
+
+    time_match = re.match(r'^([0-2]?\d):([0-5]\d)$', text)
+
+    if state["step"] == "time":
+        if not time_match:
+            return await event.reply("⚠️ صيغة الوقت غير صحيحة. أرسل بصيغة HH:MM مثل 07:00")
+        hour, minute = int(time_match.group(1)), int(time_match.group(2))
+        if hour > 23:
+            return await event.reply("⚠️ الساعة يجب أن تكون بين 00 و 23.")
+        state["hour"] = hour
+        state["minute"] = minute
+        state["step"] = "text"
+        return await event.reply("📝 الآن أرسل نص الرسالة التي تريد جدولتها.")
+
+    elif state["step"] == "text":
+        sched_id = f"s{len(db['schedules']) + 1}_{int(datetime.datetime.now().timestamp())}"
+        db["schedules"][sched_id] = {
+            "chat_id": state["chat_id"],
+            "hour": state["hour"],
+            "minute": state["minute"],
+            "text": text,
+        }
+        save_db()
+        start_schedule_task(sched_id)
+        del scheduling_state[event.sender_id]
+        return await event.reply(
+            f"✅ تم جدولة الرسالة بنجاح، ستُرسل يومياً الساعة {state['hour']:02d}:{state['minute']:02d}."
+        )
+
+    elif state["step"] == "edit_time":
+        if not time_match:
+            return await event.reply("⚠️ صيغة الوقت غير صحيحة. أرسل بصيغة HH:MM مثل 19:30")
+        hour, minute = int(time_match.group(1)), int(time_match.group(2))
+        if hour > 23:
+            return await event.reply("⚠️ الساعة يجب أن تكون بين 00 و 23.")
+
+        sched_id = state["sched_id"]
+        if sched_id in db["schedules"]:
+            db["schedules"][sched_id]["hour"] = hour
+            db["schedules"][sched_id]["minute"] = minute
+            save_db()
+            start_schedule_task(sched_id)  # إعادة تشغيل المؤقت بالوقت الجديد
+            await event.reply(f"✅ تم تحديث وقت الجدولة إلى {hour:02d}:{minute:02d}.")
+        else:
+            await event.reply("❌ لم يتم العثور على هذه الجدولة (ربما حُذفت).")
+
+        del scheduling_state[event.sender_id]
+        return
+
+# =========================
+# 12. معالج الرسائل
 # =========================
 
 @client.on(events.NewMessage)
@@ -459,8 +716,12 @@ async def global_handler(event):
     
     user_id = str(event.sender_id)
     text = event.text.strip()
-    
-    if not text.startswith(('رد ', 'حذف', 'تعديل رسائل', 'all', 'صورة ', 'فيديو ', 'كتم', 'انذار', 'الغاء كتم')):
+
+    ignored_prefixes = (
+        'رد ', 'حذف', 'تعديل رسائل', 'all', 'صورة ', 'فيديو ',
+        'كتم', 'انذار', 'الغاء كتم', 'جدولة'
+    )
+    if not text.startswith(ignored_prefixes):
         db["stats"][user_id] = db["stats"].get(user_id, 0) + 1
     
     if text == "ا":
@@ -468,14 +729,29 @@ async def global_handler(event):
         sorted_users = sorted(db["stats"].items(), key=lambda x: x[1], reverse=True)
         rank = next((i+1 for i, u in enumerate(sorted_users) if u[0] == user_id), "غير معروف")
 
+        sender = await event.get_sender()
+        first_name = sender.first_name if sender and sender.first_name else "بدون اسم"
+
         caption = (
-            f"✨ملفك الشخصي✨\n\n"
-            f"✉️ عدد رسائلك: {count}\n"
-            f"🏆 ترتيبك في المتفاعلين: {rank}\n"
-            f"📅 تاريخ انضمامك: قريباً\n\n"
-            f"استمر في التفاعل لرفع ترتيبك! ✨"
+            "┏━━━━━━━━━━━━━━━┓\n"
+            "      ✨ الملف الشخصي ✨\n"
+            "┗━━━━━━━━━━━━━━━┛\n\n"
+            f"👤 الاسم: {first_name}\n"
+            f"✉️ عدد الرسائل: {count}\n"
+            f"🏆 الترتيب بالمتفاعلين: {rank}\n"
+            f"📅 تاريخ الانضمام: قريباً\n\n"
+            "🌟 استمر في التفاعل لرفع ترتيبك!"
         )
-        await event.reply(caption)
+
+        try:
+            photo = await client.download_profile_photo(event.sender_id)
+            if photo:
+                await client.send_file(event.chat_id, photo, caption=caption, reply_to=event.id)
+            else:
+                await event.reply(caption)
+        except Exception as e:
+            print(f"Profile Photo Error: {e}")
+            await event.reply(caption)
         return
 
     if text in db["responses"]:
@@ -488,8 +764,9 @@ async def global_handler(event):
         return
 
 # =========================
-# 12. تشغيل البوت
+# 13. تشغيل البوت
 # =========================
 
 print("🚀 البوت يعمل الآن...")
+restart_all_schedules()
 client.run_until_disconnected()
