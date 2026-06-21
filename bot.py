@@ -73,6 +73,7 @@ bot_id = None
 # حالة محادثة جدولة الرسائل: sender_id -> dict بمراحل الإنشاء
 scheduling_state = {}
 # مهام الجدولة الجارية (asyncio tasks) عشان نقدر نلغيها عند الحذف/التعديل
+# المفتاح: f"{sched_id}_{time_index}"
 schedule_tasks = {}
 
 async def get_bot_id():
@@ -508,13 +509,225 @@ async def unmute_by_username(event):
         await event.reply(f"❌ فشل إلغاء الكتم: {e}")
 
 # =========================
-# 11. جدولة الرسائل (تلقائي يومي)
+# 11. جدولة الرسائل (محلل وقت + تكرار مرن، نص/صورة/فيديو)
 # =========================
-# الفكرة:
-#  - أمر "جدولة" يفتح قائمة أزرار: [➕ جدولة جديدة] [📋 عرض الجدولات] [❌ إلغاء جدولة]
-#  - عند "جدولة جديدة": يطلب من المشرف يرسل وقت الإرسال اليومي (مثال: 07:00) ثم نص الرسالة.
-#  - يتم حفظها بقاعدة البيانات ويشتغل لها مؤقّت (loop) يرسل الرسالة كل يوم بنفس الوقت.
-#  - عرض الجدولات يطلع قائمة بأزرار لكل جدولة (تعديل الوقت / حذف).
+
+ARABIC_DIGITS = str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789')
+
+WEEKDAY_NAMES = {
+    "السبت": 5, "الأحد": 6, "الاحد": 6, "الإثنين": 0, "الاثنين": 0,
+    "الثلاثاء": 1, "الثلاثا": 1, "الأربعاء": 2, "الاربعاء": 2, "الاربعا": 2,
+    "الخميس": 3, "الجمعة": 4, "الجمعه": 4,
+}
+# ملاحظة: Python weekday(): الإثنين=0 ... الأحد=6
+
+def normalize_text(s):
+    s = s.translate(ARABIC_DIGITS)
+    s = s.replace('ـ', '')
+    return s
+
+
+def parse_times(raw_text):
+    """
+    يحاول استخراج وقت أو وقتين (صباحاً/مساءً) من نص حر.
+    يدعم: '7 صباحا', '٧ صباحا', '7:30', '7:30 مساء', '19:30',
+          '7 صباحا و7 مساء', '7 و 19:30', 'الساعة 7 مساء' ... إلخ.
+    يرجع list من dict {hour, minute} أو [] إذا فشل.
+    """
+    text = normalize_text(raw_text).strip()
+    text = text.replace("الساعة", "").replace("الساعه", "").replace("ساعة", "").replace("ساعه", "")
+
+    # نقسم على "و" عشان نمسك حالة وقتين بنفس الرسالة (يغطي "7 و7" و"7و 7" و"7و7")
+    parts = re.split(r'\s+و(?=\s*\d)|\s*و(?=\d)|\s*&\s*|\s*,\s*', text)
+
+    results = []
+    time_pattern = re.compile(
+        r'(\d{1,2})(?:[:٫.](\d{2}))?\s*(صباحا|صباحاً|ص\b|am|AM|مساءا|مساءاً|مساء|مساءً|م\b|pm|PM|ظهرا|ظهراً|ظهر|عصرا|عصراً|عصر)?'
+    )
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        m = time_pattern.search(part)
+        if not m:
+            continue
+
+        hour = int(m.group(1))
+        minute = int(m.group(2)) if m.group(2) else 0
+        period = (m.group(3) or "").strip()
+
+        is_pm = period in ("مساءا", "مساءاً", "مساء", "مساءً", "م", "pm", "PM", "عصرا", "عصراً", "عصر")
+        is_am = period in ("صباحا", "صباحاً", "ص", "am", "AM")
+        is_noon = period in ("ظهرا", "ظهراً", "ظهر")
+
+        if hour > 23 or minute > 59:
+            continue
+
+        if is_noon:
+            if hour < 12:
+                hour += 12 if hour != 12 else 0
+        elif is_pm:
+            if hour < 12:
+                hour += 12
+        elif is_am:
+            if hour == 12:
+                hour = 0
+        else:
+            pass
+
+        results.append({"hour": hour, "minute": minute})
+
+    return results
+
+
+def parse_recurrence(raw_text):
+    """
+    يحاول استخراج نوع التكرار من نص حر. يرجع dict بالشكل:
+      {"type": "daily"}
+      {"type": "weekly", "weekday": 4}
+      {"type": "interval_days", "days": 2}
+      {"type": "monthly", "day": 15}
+      {"type": "monthly_count", "times": 2}
+    إذا ما لقى شي واضح يرجع {"type": "daily"} كافتراضي.
+    """
+    text = normalize_text(raw_text).strip()
+
+    m = re.search(r'كل\s*(\d+)\s*(?:يوم|أيام|ايام)', text)
+    if m:
+        return {"type": "interval_days", "days": int(m.group(1))}
+    if "كل يومين" in text or "يوم بعد يوم" in text or "يوم وبعد يوم" in text:
+        return {"type": "interval_days", "days": 2}
+    if "كل ثلاث ايام" in text or "كل ثلاثة ايام" in text or "كل ثلاثة أيام" in text:
+        return {"type": "interval_days", "days": 3}
+
+    for name, wd in WEEKDAY_NAMES.items():
+        if name in text:
+            return {"type": "weekly", "weekday": wd}
+    if "اسبوعي" in text or "أسبوعي" in text or "كل اسبوع" in text or "كل أسبوع" in text or "بالاسبوع مره" in text or "بالاسبوع مرة" in text or "مرة بالاسبوع" in text or "مره بالاسبوع" in text:
+        return {"type": "weekly", "weekday": None}  # None = نفس يوم الإنشاء
+
+    m = re.search(r'(\d+)\s*مر(?:ات|ة|ه)?\s*(?:في\s*ال|بال)?شهر', text)
+    if m:
+        return {"type": "monthly_count", "times": int(m.group(1))}
+    if "مرتين بالشهر" in text or "مرتين في الشهر" in text:
+        return {"type": "monthly_count", "times": 2}
+
+    m = re.search(r'يوم\s*(\d{1,2})\s*(?:من\s*)?(?:كل\s*)?شهر', text)
+    if m:
+        day = int(m.group(1))
+        if 1 <= day <= 31:
+            return {"type": "monthly", "day": day}
+    if "شهري" in text or "كل شهر" in text or "بالشهر مره" in text or "بالشهر مرة" in text or "مرة بالشهر" in text or "مره بالشهر" in text:
+        return {"type": "monthly", "day": None}  # None = نفس يوم الإنشاء
+
+    if "يوم" in text or "يوميا" in text or "يومياً" in text:
+        if "يومين" not in text:
+            return {"type": "daily"}
+
+    return {"type": "daily"}
+
+
+def recurrence_description(rec, created_dt=None):
+    t = rec.get("type", "daily")
+    if t == "daily":
+        return "يومياً"
+    if t == "interval_days":
+        return f"كل {rec['days']} يوم"
+    if t == "weekly":
+        wd = rec.get("weekday")
+        if wd is None and created_dt:
+            wd = created_dt.weekday()
+        names = {0: "الإثنين", 1: "الثلاثاء", 2: "الأربعاء", 3: "الخميس", 4: "الجمعة", 5: "السبت", 6: "الأحد"}
+        return f"أسبوعياً (كل {names.get(wd, 'نفس اليوم')})"
+    if t == "monthly":
+        day = rec.get("day")
+        if day is None and created_dt:
+            day = created_dt.day
+        return f"شهرياً (يوم {day})"
+    if t == "monthly_count":
+        return f"{rec['times']} مرات بالشهر"
+    return "يومياً"
+
+
+def next_run_datetime(hour, minute, rec, now=None, created_dt=None):
+    """يحسب موعد التنفيذ القادم بناءً على الوقت والتكرار."""
+    now = now or datetime.datetime.now()
+    t = rec.get("type", "daily")
+
+    base = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    if t == "daily":
+        if base <= now:
+            base += datetime.timedelta(days=1)
+        return base
+
+    if t == "interval_days":
+        days = max(1, rec.get("days", 1))
+        candidate = base
+        if candidate <= now:
+            candidate += datetime.timedelta(days=1)
+        if created_dt:
+            ref = created_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            delta_days = (candidate.date() - ref.date()).days
+            remainder = delta_days % days
+            if remainder != 0:
+                candidate += datetime.timedelta(days=(days - remainder))
+        return candidate
+
+    if t == "weekly":
+        wd = rec.get("weekday")
+        if wd is None and created_dt:
+            wd = created_dt.weekday()
+        if wd is None:
+            wd = now.weekday()
+        candidate = base
+        days_ahead = (wd - candidate.weekday()) % 7
+        candidate += datetime.timedelta(days=days_ahead)
+        if candidate <= now:
+            candidate += datetime.timedelta(days=7)
+        return candidate
+
+    if t == "monthly":
+        day = rec.get("day")
+        if day is None and created_dt:
+            day = created_dt.day
+        if day is None:
+            day = now.day
+        year, month = now.year, now.month
+        while True:
+            try:
+                candidate = datetime.datetime(year, month, day, hour, minute)
+            except ValueError:
+                month += 1
+                if month > 12:
+                    month = 1
+                    year += 1
+                continue
+            if candidate > now:
+                return candidate
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+
+    if t == "monthly_count":
+        times = max(1, rec.get("times", 1))
+        interval_days = max(1, 30 // times)
+        candidate = base
+        if created_dt:
+            ref = created_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            elapsed = (now - ref).days
+            cycles = (elapsed // interval_days) + 1
+            candidate = ref + datetime.timedelta(days=interval_days * cycles)
+        if candidate <= now:
+            candidate += datetime.timedelta(days=interval_days)
+        return candidate
+
+    if base <= now:
+        base += datetime.timedelta(days=1)
+    return base
+
 
 def schedule_keyboard():
     return [
@@ -530,44 +743,61 @@ def schedule_item_keyboard(sched_id):
         ]
     ]
 
-async def schedule_loop(sched_id):
-    """يرسل الرسالة المجدولة يومياً بنفس الوقت المحدد."""
+
+async def schedule_loop(sched_id, time_index):
+    """يرسل الرسالة/الوسائط المجدولة بشكل متكرر حسب التكرار المحدد."""
     while True:
         sched = db["schedules"].get(sched_id)
-        if not sched:
-            return  # تم حذفها
+        if not sched or time_index >= len(sched.get("times", [])):
+            return  # تم حذفها أو حذف هذا الوقت
+
+        t = sched["times"][time_index]
+        rec = sched.get("recurrence", {"type": "daily"})
+        created_dt = None
+        try:
+            created_dt = datetime.datetime.fromisoformat(sched["created_at"])
+        except Exception:
+            pass
 
         now = datetime.datetime.now()
-        hour, minute = sched["hour"], sched["minute"]
-        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if target <= now:
-            target += datetime.timedelta(days=1)
+        target = next_run_datetime(t["hour"], t["minute"], rec, now=now, created_dt=created_dt)
 
         wait_seconds = (target - now).total_seconds()
-        await asyncio.sleep(wait_seconds)
+        if wait_seconds > 0:
+            await asyncio.sleep(wait_seconds)
 
-        # إعادة التأكد إنها ما انحذفت أثناء الانتظار
         sched = db["schedules"].get(sched_id)
-        if not sched:
+        if not sched or time_index >= len(sched.get("times", [])):
             return
 
         try:
-            await client.send_message(int(sched["chat_id"]), sched["text"])
+            chat_id = int(sched["chat_id"])
+            content = sched.get("content", {})
+            if content.get("type") == "media":
+                await client.send_file(chat_id, content["file"], caption=content.get("caption") or None)
+            else:
+                await client.send_message(chat_id, content.get("text", ""))
         except Exception as e:
-            print(f"Schedule Send Error ({sched_id}): {e}")
+            print(f"Schedule Send Error ({sched_id}#{time_index}): {e}")
 
-        # نكمل اللوب لليوم التالي
+        # نعيد الحساب باللوب لمرة التنفيذ القادمة
+
 
 def start_schedule_task(sched_id):
-    if sched_id in schedule_tasks:
-        schedule_tasks[sched_id].cancel()
-    task = asyncio.create_task(schedule_loop(sched_id))
-    schedule_tasks[sched_id] = task
+    sched = db["schedules"].get(sched_id)
+    if not sched:
+        return
+    for idx in range(len(sched.get("times", []))):
+        key = f"{sched_id}_{idx}"
+        if key in schedule_tasks:
+            schedule_tasks[key].cancel()
+        schedule_tasks[key] = asyncio.create_task(schedule_loop(sched_id, idx))
 
 def stop_schedule_task(sched_id):
-    task = schedule_tasks.pop(sched_id, None)
-    if task:
-        task.cancel()
+    keys = [k for k in schedule_tasks if k.startswith(f"{sched_id}_")]
+    for k in keys:
+        schedule_tasks[k].cancel()
+        schedule_tasks.pop(k, None)
 
 def restart_all_schedules():
     for sched_id in list(db["schedules"].keys()):
@@ -585,11 +815,20 @@ async def schedule_new(event):
     if not await is_admin(event):
         return await event.answer("ليس لديك صلاحية.", alert=True)
 
-    scheduling_state[event.sender_id] = {
+    state = {
         "step": "time",
         "chat_id": event.chat_id,
+        "conv_msg_ids": [],
     }
-    await event.edit("🕖 أرسل الوقت اليومي للإرسال بصيغة HH:MM (مثال: 07:00)")
+    scheduling_state[event.sender_id] = state
+
+    msg = await event.get_message()
+    state["conv_msg_ids"].append(msg.id)  # رسالة القائمة نفسها
+
+    await event.edit(
+        "🕖 أرسل وقت/أوقات الإرسال (يقبل صيغ متعددة):\n"
+        "مثال: 7 صباحا — ٧:٣٠ — 19:30 — 7 صباحا و7 مساء"
+    )
 
 
 @client.on(events.CallbackQuery(data=b"sched_list"))
@@ -607,8 +846,15 @@ async def schedule_list(event):
 
     await event.edit("📋 الجدولات الحالية:", buttons=schedule_keyboard())
     for sid, s in chat_schedules.items():
-        preview = s["text"] if len(s["text"]) <= 80 else s["text"][:77] + "..."
-        msg = f"⏰ الوقت: {s['hour']:02d}:{s['minute']:02d}\n📝 الرسالة: {preview}"
+        times_str = " / ".join(f"{t['hour']:02d}:{t['minute']:02d}" for t in s.get("times", []))
+        content = s.get("content", {})
+        if content.get("type") == "media":
+            preview = f"[{content.get('media_kind', 'وسائط')}]" + (f" — {content.get('caption','')[:50]}" if content.get('caption') else "")
+        else:
+            txt = content.get("text", "")
+            preview = txt if len(txt) <= 80 else txt[:77] + "..."
+        rec_desc = recurrence_description(s.get("recurrence", {"type": "daily"}))
+        msg = f"⏰ الأوقات: {times_str}\n🔁 التكرار: {rec_desc}\n📝 المحتوى: {preview}"
         await client.send_message(
             event.chat_id, msg, buttons=schedule_item_keyboard(sid)
         )
@@ -620,13 +866,38 @@ async def schedule_delete(event):
         return await event.answer("ليس لديك صلاحية.", alert=True)
 
     sched_id = event.pattern_match.group(1).decode()
-    if sched_id in db["schedules"]:
+    sched = db["schedules"].get(sched_id)
+
+    if sched:
+        # حذف كل رسائل ضبط الجدولة المرتبطة (من لحظة الضغط على "جدولة جديدة" حتى التأكيد)
+        setup_ids = sched.get("setup_msg_ids", [])
+        chat_id = int(sched["chat_id"])
         db["schedules"].pop(sched_id, None)
         save_db()
         stop_schedule_task(sched_id)
-        await event.edit("🗑️ تم حذف الجدولة بنجاح.")
+
+        try:
+            if setup_ids:
+                await client.delete_messages(chat_id, setup_ids)
+        except Exception as e:
+            print(f"Setup messages delete error: {e}")
+
+        try:
+            await event.delete()  # حذف بطاقة عرض هذه الجدولة نفسها
+        except:
+            pass
+
+        confirm = await client.send_message(chat_id, "🗑️ تم حذف الجدولة.")
+        await asyncio.sleep(3)
+        try:
+            await confirm.delete()
+        except:
+            pass
     else:
-        await event.edit("❌ لم يتم العثور على هذه الجدولة (ربما حُذفت مسبقاً).")
+        try:
+            await event.edit("❌ لم يتم العثور على هذه الجدولة (ربما حُذفت مسبقاً).")
+        except:
+            pass
 
 
 @client.on(events.CallbackQuery(pattern=rb"^sched_edit_(.+)$"))
@@ -642,13 +913,17 @@ async def schedule_edit(event):
         "step": "edit_time",
         "chat_id": event.chat_id,
         "sched_id": sched_id,
+        "conv_msg_ids": [],
     }
-    await event.edit("🕖 أرسل الوقت الجديد بصيغة HH:MM (مثال: 19:30)")
+    await event.edit(
+        "🕖 أرسل الوقت/الأوقات الجديدة (نفس الصيغ المرنة مدعومة):\n"
+        "مثال: 7 صباحا — 19:30 — 7 صباحا و7 مساء"
+    )
 
 
 @client.on(events.NewMessage)
 async def schedule_conversation_handler(event):
-    """يلتقط الرسائل أثناء عملية إنشاء/تعديل الجدولة (وقت ثم نص)."""
+    """يلتقط الرسائل أثناء عملية إنشاء/تعديل الجدولة (وقت → تكرار → محتوى)."""
     if event.sender_id not in scheduling_state:
         return
     if not await is_admin(event):
@@ -657,50 +932,103 @@ async def schedule_conversation_handler(event):
     state = scheduling_state[event.sender_id]
     text = event.text.strip() if event.text else ""
 
-    time_match = re.match(r'^([0-2]?\d):([0-5]\d)$', text)
+    # نتتبع رسالة المستخدم بالمحادثة
+    state.setdefault("conv_msg_ids", []).append(event.id)
 
     if state["step"] == "time":
-        if not time_match:
-            return await event.reply("⚠️ صيغة الوقت غير صحيحة. أرسل بصيغة HH:MM مثل 07:00")
-        hour, minute = int(time_match.group(1)), int(time_match.group(2))
-        if hour > 23:
-            return await event.reply("⚠️ الساعة يجب أن تكون بين 00 و 23.")
-        state["hour"] = hour
-        state["minute"] = minute
-        state["step"] = "text"
-        return await event.reply("📝 الآن أرسل نص الرسالة التي تريد جدولتها.")
+        times = parse_times(text)
+        if not times:
+            err = await event.reply(
+                "⚠️ ما قدرت أفهم الوقت. جرّب مثلاً: 7 صباحا — ٧:٣٠ مساءً — 19:30 — 7 صباحا و7 مساء"
+            )
+            state["conv_msg_ids"].append(err.id)
+            return
 
-    elif state["step"] == "text":
+        state["times"] = times
+        state["step"] = "recurrence"
+        ask = await event.reply(
+            "🔁 خلال كم تتكرر الرسالة؟ اكتب مثلاً:\n"
+            "يومي — كل يومين — كل 3 ايام — اسبوعي — الجمعة — شهري — يوم 15 من كل شهر — مرتين بالشهر\n"
+            "أو اكتب (تخطي) لتكون يومية افتراضياً."
+        )
+        state["conv_msg_ids"].append(ask.id)
+        return
+
+    elif state["step"] == "recurrence":
+        if text in ("تخطي", "تجاوز", "لا", "-"):
+            rec = {"type": "daily"}
+        else:
+            rec = parse_recurrence(text)
+        state["recurrence"] = rec
+        state["step"] = "content"
+        ask = await event.reply("📝 الآن أرسل نص الرسالة، أو أرسل صورة/فيديو (مع كابشن اختياري) لتُرسل تلقائياً.")
+        state["conv_msg_ids"].append(ask.id)
+        return
+
+    elif state["step"] == "content":
+        if event.photo or event.video:
+            media_kind = "صورة" if event.photo else "فيديو"
+            content = {
+                "type": "media",
+                "media_kind": media_kind,
+                "file": event.media,
+                "caption": text or "",
+            }
+        elif text:
+            content = {"type": "text", "text": text}
+        else:
+            err = await event.reply("⚠️ أرسل نص الرسالة أو صورة/فيديو.")
+            state["conv_msg_ids"].append(err.id)
+            return
+
         sched_id = f"s{len(db['schedules']) + 1}_{int(datetime.datetime.now().timestamp())}"
         db["schedules"][sched_id] = {
             "chat_id": state["chat_id"],
-            "hour": state["hour"],
-            "minute": state["minute"],
-            "text": text,
+            "times": state["times"],
+            "recurrence": state["recurrence"],
+            "content": content,
+            "created_at": datetime.datetime.now().isoformat(),
+            "setup_msg_ids": [],  # نملأها بعد إرسال رسالة التأكيد
         }
+
+        times_str = " / ".join(f"{t['hour']:02d}:{t['minute']:02d}" for t in state["times"])
+        rec_desc = recurrence_description(state["recurrence"])
+        confirm = await event.reply(
+            f"✅ تم جدولة الرسالة بنجاح.\n⏰ الأوقات: {times_str}\n🔁 التكرار: {rec_desc}"
+        )
+        state["conv_msg_ids"].append(confirm.id)
+
+        # نحفظ كل رسائل المحادثة (من لحظة الضغط على "جدولة جديدة" وحتى التأكيد)
+        db["schedules"][sched_id]["setup_msg_ids"] = list(state["conv_msg_ids"])
         save_db()
         start_schedule_task(sched_id)
+
         del scheduling_state[event.sender_id]
-        return await event.reply(
-            f"✅ تم جدولة الرسالة بنجاح، ستُرسل يومياً الساعة {state['hour']:02d}:{state['minute']:02d}."
-        )
+        return
 
     elif state["step"] == "edit_time":
-        if not time_match:
-            return await event.reply("⚠️ صيغة الوقت غير صحيحة. أرسل بصيغة HH:MM مثل 19:30")
-        hour, minute = int(time_match.group(1)), int(time_match.group(2))
-        if hour > 23:
-            return await event.reply("⚠️ الساعة يجب أن تكون بين 00 و 23.")
+        times = parse_times(text)
+        if not times:
+            err = await event.reply(
+                "⚠️ ما قدرت أفهم الوقت. جرّب مثلاً: 7 صباحا — 19:30 — 7 صباحا و7 مساء"
+            )
+            state["conv_msg_ids"].append(err.id)
+            return
 
         sched_id = state["sched_id"]
         if sched_id in db["schedules"]:
-            db["schedules"][sched_id]["hour"] = hour
-            db["schedules"][sched_id]["minute"] = minute
+            db["schedules"][sched_id]["times"] = times
             save_db()
-            start_schedule_task(sched_id)  # إعادة تشغيل المؤقت بالوقت الجديد
-            await event.reply(f"✅ تم تحديث وقت الجدولة إلى {hour:02d}:{minute:02d}.")
+            start_schedule_task(sched_id)  # إعادة تشغيل المؤقتات بالأوقات الجديدة
+            times_str = " / ".join(f"{t['hour']:02d}:{t['minute']:02d}" for t in times)
+            ok = await event.reply(f"✅ تم تحديث أوقات الجدولة إلى: {times_str}")
+            # نضيف رسائل التعديل لقائمة setup_msg_ids الأصلية حتى تُحذف لاحقاً مع الجدولة
+            db["schedules"][sched_id].setdefault("setup_msg_ids", [])
+            db["schedules"][sched_id]["setup_msg_ids"].extend(state["conv_msg_ids"] + [ok.id])
+            save_db()
         else:
-            await event.reply("❌ لم يتم العثور على هذه الجدولة (ربما حُذفت).")
+            err = await event.reply("❌ لم يتم العثور على هذه الجدولة (ربما حُذفت).")
+            state["conv_msg_ids"].append(err.id)
 
         del scheduling_state[event.sender_id]
         return
@@ -733,9 +1061,7 @@ async def global_handler(event):
         first_name = sender.first_name if sender and sender.first_name else "بدون اسم"
 
         caption = (
-            "┏━━━━━━━━━━━━━━━┓\n"
-            "      ✨ الملف الشخصي ✨\n"
-            "┗━━━━━━━━━━━━━━━┛\n\n"
+            "✨ الملف الشخصي ✨\n\n"
             f"👤 الاسم: {first_name}\n"
             f"✉️ عدد الرسائل: {count}\n"
             f"🏆 الترتيب بالمتفاعلين: {rank}\n"
