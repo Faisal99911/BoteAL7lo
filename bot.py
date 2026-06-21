@@ -269,37 +269,44 @@ async def delete_last_n_messages(event):
         # المحاولة بالطريقة الرسمية (تنجح لو القروب سوبر جروب)
         async for msg in client.iter_messages(chat_id, offset_id=event.id, limit=count):
             ids_to_delete.append(msg.id)
-    except Exception as e:
-        # [الحل البديل والذكي] إذا رفض تليجرام قراءة السجل لأن الجروب عادي:
-        # نخمن المعرفات السابقة تنازلياً لأنها تكون متسلسلة في المجموعات العادية
+    except:
+        # الحل البديل والذكي للجروبات العادية: تخمين المعرفات السابقة تنازلياً
         current_id = event.id
         for _ in range(count):
             current_id -= 1
             if current_id > 0:
                 ids_to_delete.append(current_id)
 
-    # الحذف الفعلي على دفعات
+    # تنفيذ الحذف الفعلي ومعالجة النتيجة بذكاء
     deleted_total = 0
-    try:
-        chunk_size = 100
-        for i in range(0, len(ids_to_delete), chunk_size):
-            chunk = ids_to_delete[i:i + chunk_size]
+    chunk_size = 100
+    
+    for i in range(0, len(ids_to_delete), chunk_size):
+        chunk = ids_to_delete[i:i + chunk_size]
+        try:
             await client.delete_messages(chat_id, chunk)
             deleted_total += len(chunk)
-            await asyncio.sleep(0.3)
+        except Exception as e:
+            # نتخطى الأخطاء الفرعية أثناء الحذف التخميني إذا كان الحذف شغال فعلياً
+            print(f"Chunk delete log: {e}")
+        await asyncio.sleep(0.3)
 
+    # نفحص لو البوت نجح فعلياً في حذف أي شيء (بما فيه رسالة الأمر)
+    if deleted_total > 0:
         try:
             await status_msg.delete()
         except:
             pass
-
-        # رسالة تأكيد مؤقتة تنحذف بعد 3 ثواني
-        confirm = await client.send_message(chat_id, f"✅ تم حذف {deleted_total - 1} رسالة بنجاح.")
+        
+        # إرسال رسالة التأكيد وحذفها بعد 3 ثواني
+        confirm = await client.send_message(chat_id, f"✅ تم حذف الرسائل بنجاح.")
         await asyncio.sleep(3)
-        await confirm.delete()
-
-    except Exception as e:
-        print(f"Bulk Delete Error: {e}")
+        try:
+            await confirm.delete()
+        except:
+            pass
+    else:
+        # لو ما حذف أي شيء أبداً وفشل تماماً هنا نطبع رسالة الخطأ
         await status_msg.edit(f"❌ فشل الحذف. تأكد أن البوت يملك صلاحية 'حذف الرسائل'.")
 
 # ──────────────────────────────────────────────────────────────────────────────
