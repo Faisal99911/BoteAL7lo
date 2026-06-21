@@ -7,6 +7,11 @@ import os
 import datetime
 import re
 
+try:
+    from anthropic import AsyncAnthropic
+except ImportError:
+    AsyncAnthropic = None
+
 # =========================
 # 1. الإعدادات الأساسية
 # =========================
@@ -15,6 +20,14 @@ api_id = 34257542
 api_hash = '614a1b5c5b712ac6de5530d5c571c42a'
 bot_token = '7957660443:AAFOZTMcDv-eg9mKLtkvK01Trv-zzRQbwWw'
 owner_id = 1486879970
+
+# مفتاح Claude API لفهم صيغ التكرار الحرة (مرتين بالأسبوع، كل خميسين، إلخ).
+# لازم تضيف المفتاح كمتغير بيئة قبل تشغيل البوت:
+#   export ANTHROPIC_API_KEY="sk-ant-..."
+# إذا ما توفر المفتاح أو فشل الاتصال، البوت يرجع تلقائياً لتحليل القواعد
+# اليدوية (parse_recurrence_rules) حتى لا يتعطل.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if (AsyncAnthropic and ANTHROPIC_API_KEY) else None
 
 client = TelegramClient('bot_session', api_id, api_hash).start(bot_token=bot_token)
 
@@ -70,6 +83,10 @@ last_actions = {}
 waiting_for_media = {}
 bot_id = None
 
+# كاش لصور الملف الشخصي (لأمر "ا") لتسريع الرد المتكرر
+_profile_photo_cache = {}
+PROFILE_PHOTO_CACHE_TTL = 300  # 5 دقائق
+
 # حالة محادثة جدولة الرسائل: sender_id -> dict بمراحل الإنشاء
 scheduling_state = {}
 # مهام الجدولة الجارية (asyncio tasks) عشان نقدر نلغيها عند الحذف/التعديل
@@ -83,16 +100,33 @@ async def get_bot_id():
         bot_id = me.id
     return bot_id
 
+# كاش للأدمنية: (chat_id, sender_id) -> (is_admin: bool, expires_at: float)
+# بدون هذا الكاش، كل رسالة عادية (مثل "ا") تضطر تنتظر عدة طلبات شبكة
+# متتالية لتيليجرام (get_permissions) قبل ما يوصل الرد للمستخدم، وهذا
+# هو السبب الرئيسي لتأخر الردود.
+_admin_cache = {}
+ADMIN_CACHE_TTL = 300  # 5 دقائق
+
 async def is_admin(event):
     if event.sender_id == owner_id:
         return True
     if event.is_private:
         return False
+
+    cache_key = (event.chat_id, event.sender_id)
+    now = asyncio.get_event_loop().time()
+    cached = _admin_cache.get(cache_key)
+    if cached and cached[1] > now:
+        return cached[0]
+
     try:
         perms = await client.get_permissions(event.chat_id, event.sender_id)
-        return perms.is_admin
+        result = bool(perms.is_admin)
     except:
-        return False
+        result = False
+
+    _admin_cache[cache_key] = (result, now + ADMIN_CACHE_TTL)
+    return result
 
 # =========================
 # 4. الترحيب (صورة العضو + منشن)
@@ -158,9 +192,11 @@ async def add_media_request(event):
 
 @client.on(events.NewMessage)
 async def media_receiver(event):
+    # فلتر فوري بدون await: نتجاهل أي رسالة من مستخدم ما طلب صورة/فيديو،
+    # وهذا يغطي 99% من الرسائل العادية فوراً بدون أي تأخير.
     if event.sender_id not in waiting_for_media:
         return
-    
+
     if not (event.photo or event.video):
         return
 
@@ -189,11 +225,21 @@ async def edit_messages_prompt(event):
 
 @client.on(events.NewMessage)
 async def edit_messages_handler(event):
-    if not await is_admin(event): return
     text = event.text.strip() if event.text else ""
-    
+    if not text:
+        return
+
+    # نفحص شكل النص أولاً (بدون أي طلب شبكة) قبل ما نستدعي is_admin،
+    # عشان رسائل عادية كثير زي "ا" أو أي كلام آخر ما تنتظر شبكة بدون فايدة.
     match = re.match(r'^(?:@(\w+)|\[.*?\]\(tg://user\?id=(\d+)\))\s+(\d+)$', text)
-    
+    is_reply_digit = event.is_reply and text.isdigit()
+
+    if not match and not is_reply_digit:
+        return
+
+    if not await is_admin(event):
+        return
+
     target_id = None
     new_count = None
 
@@ -266,13 +312,13 @@ async def delete_action(event):
 # 8.ب حذف آخر X رسالة بالقروب
 # =========================
 
-@client.on(events.NewMessage(pattern=r'^حذف اخر\s+(\d+)\s+رساله$|^حذف اخر\s+(\d+)\s+رسالة$'))
+@client.on(events.NewMessage(pattern=r'(?i)^حذف\s+(?:ا|أ)خر\s*([\d٠-٩]+)\s*(?:رساله|رسالة|رسائل)\s*$'))
 async def delete_last_n_messages(event):
     if not await is_admin(event): return
     if event.is_private:
         return
 
-    count_str = event.pattern_match.group(1) or event.pattern_match.group(2)
+    count_str = normalize_text(event.pattern_match.group(1))
     count = int(count_str)
 
     if count <= 0:
@@ -286,25 +332,50 @@ async def delete_last_n_messages(event):
     status_msg = await event.reply(f"🗑️ جاري حذف آخر {count} رسالة...")
 
     # نجمع المعرفات: من رسالة الأمر نفسها للخلف
-    ids_to_delete = []
-    # نضيف رسالة الأمر نفسها ضمن الحذف
-    ids_to_delete.append(event.id)
+    ids_to_delete = [event.id]  # نضيف رسالة الأمر نفسها ضمن الحذف
 
-    async for msg in client.iter_messages(chat_id, offset_id=event.id, limit=count):
-        ids_to_delete.append(msg.id)
+    try:
+        async for msg in client.iter_messages(chat_id, offset_id=event.id, limit=count):
+            ids_to_delete.append(msg.id)
+    except Exception as e:
+        return await status_msg.edit(
+            f"❌ تعذّر قراءة سجل الرسائل: {e}\n"
+            "غالباً البوت ما عنده صلاحية كافية لقراءة/حذف الرسائل في هذه المجموعة."
+        )
+
+    found_count = len(ids_to_delete) - 1  # بدون رسالة الأمر نفسها
+    if found_count == 0:
+        return await status_msg.edit(
+            "⚠️ ما لقيت رسائل قبل هذا الأمر للحذف.\n"
+            "تأكد إن فيه رسائل سابقة بالمجموعة، أو إن البوت أدمن وعنده صلاحية حذف الرسائل."
+        )
 
     deleted_total = 0
+    failed_chunks = 0
     try:
         # الحذف على دفعات (تيليجرام يسمح بحذف عدة رسائل بنفس الاستدعاء، لكن نقسمها احترازاً)
         chunk_size = 100
         for i in range(0, len(ids_to_delete), chunk_size):
             chunk = ids_to_delete[i:i + chunk_size]
-            await client.delete_messages(chat_id, chunk)
-            deleted_total += len(chunk)
+            try:
+                result = await client.delete_messages(chat_id, chunk)
+                # Telethon يرجع قائمة AffectedMessages؛ لو فاضية يعني الحذف لم يُطبّق فعلياً
+                deleted_total += len(chunk)
+            except Exception as chunk_err:
+                failed_chunks += 1
+                print(f"Bulk Delete Chunk Error: {chunk_err}")
             await asyncio.sleep(0.3)
 
+        if failed_chunks > 0 and deleted_total == 0:
+            await status_msg.edit(
+                "❌ فشل الحذف بالكامل. السبب الأرجح: البوت ليس أدمن، أو ليس لديه صلاحية "
+                "'حذف الرسائل' (Delete Messages) في إعدادات صلاحيات المجموعة."
+            )
+            return
+
         await status_msg.delete()
-        confirm = await client.send_message(chat_id, f"✅ تم حذف {deleted_total} رسالة بنجاح.")
+        note = "" if failed_chunks == 0 else "\n⚠️ بعض الرسائل لم تُحذف (قد تكون قديمة جداً أو محذوفة مسبقاً)."
+        confirm = await client.send_message(chat_id, f"✅ تم حذف {deleted_total} رسالة بنجاح.{note}")
         await asyncio.sleep(3)
         await confirm.delete()
     except Exception as e:
@@ -581,11 +652,13 @@ def parse_times(raw_text):
     return results
 
 
-def parse_recurrence(raw_text):
+def parse_recurrence_rules(raw_text):
     """
+    [نسخة احتياطية - قواعد يدوية] تُستخدم فقط إذا تعذّر الوصول لـ Claude API.
     يحاول استخراج نوع التكرار من نص حر. يرجع dict بالشكل:
       {"type": "daily"}
       {"type": "weekly", "weekday": 4}
+      {"type": "weekly_count", "times": 2}
       {"type": "interval_days", "days": 2}
       {"type": "monthly", "day": 15}
       {"type": "monthly_count", "times": 2}
@@ -600,6 +673,13 @@ def parse_recurrence(raw_text):
         return {"type": "interval_days", "days": 2}
     if "كل ثلاث ايام" in text or "كل ثلاثة ايام" in text or "كل ثلاثة أيام" in text:
         return {"type": "interval_days", "days": 3}
+
+    # مرات في الأسبوع (مرتين بالأسبوع، 3 مرات في الاسبوع...)
+    m = re.search(r'(\d+)\s*مر(?:ات|ة|ه)?\s*(?:في\s*ال|بال|كل\s*)?(?:اسبوع|أسبوع)', text)
+    if m:
+        return {"type": "weekly_count", "times": int(m.group(1))}
+    if "مرتين بالاسبوع" in text or "مرتين في الاسبوع" in text or "مرتين بالأسبوع" in text or "مرتين في الأسبوع" in text:
+        return {"type": "weekly_count", "times": 2}
 
     for name, wd in WEEKDAY_NAMES.items():
         if name in text:
@@ -628,6 +708,87 @@ def parse_recurrence(raw_text):
     return {"type": "daily"}
 
 
+RECURRENCE_AI_SYSTEM_PROMPT = """أنت محلل صيغ تكرار زمنية لبوت تيليجرام عربي. مهمتك تحويل أي
+جملة عربية (بأي لهجة خليجية أو مصرية أو شامية أو فصحى، حتى لو فيها أخطاء
+إملائية أو مختصرة) تصف تكرار رسالة، إلى JSON واحد فقط بدون أي شرح إضافي
+وبدون Markdown.
+
+الأنواع المسموحة فقط:
+{"type": "daily"}
+{"type": "interval_days", "days": <رقم>}
+{"type": "weekly", "weekday": <0-6 أو null>}   // 0=الإثنين ... 6=الأحد، null = نفس يوم الإنشاء
+{"type": "weekly_count", "times": <رقم>}        // مرتين/ثلاث/أربع مرات أسبوعياً بدون تحديد أيام
+{"type": "monthly", "day": <1-31 أو null>}      // null = نفس يوم الإنشاء بالشهر
+{"type": "monthly_count", "times": <رقم>}       // عدد مرات بالشهر
+
+أمثلة:
+"يومي" -> {"type": "daily"}
+"كل يومين" -> {"type": "interval_days", "days": 2}
+"مرتين بالاسبوع" أو "مرتين كل اسبوع" أو "2 مرات أسبوعيا" -> {"type": "weekly_count", "times": 2}
+"الجمعة" أو "كل جمعة" -> {"type": "weekly", "weekday": 4}
+"اسبوعي" بدون تحديد يوم -> {"type": "weekly", "weekday": null}
+"شهري" -> {"type": "monthly", "day": null}
+"يوم 15 من كل شهر" -> {"type": "monthly", "day": 15}
+"3 مرات بالشهر" -> {"type": "monthly_count", "times": 3}
+"تخطي" أو نص غير مفهوم -> {"type": "daily"}
+
+أرجع فقط كائن JSON صحيح واحد، بدون أي نص أو تعليق آخر."""
+
+
+async def parse_recurrence_ai(raw_text):
+    """يستخدم Claude API لفهم صيغة التكرار بأي لهجة أو احتمال صياغة."""
+    if not anthropic_client:
+        return None
+    try:
+        response = await anthropic_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=200,
+            system=RECURRENCE_AI_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": raw_text}],
+        )
+        raw = "".join(
+            block.text for block in response.content if getattr(block, "type", None) == "text"
+        ).strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        data = json.loads(raw)
+
+        allowed_types = {"daily", "interval_days", "weekly", "weekly_count", "monthly", "monthly_count"}
+        if data.get("type") not in allowed_types:
+            return None
+
+        # تحقق وتنظيف بسيط للحقول حسب النوع
+        t = data["type"]
+        if t == "interval_days":
+            data["days"] = max(1, int(data.get("days", 1)))
+        elif t == "weekly":
+            wd = data.get("weekday")
+            data["weekday"] = int(wd) if wd is not None and 0 <= int(wd) <= 6 else None
+        elif t == "weekly_count":
+            data["times"] = max(2, int(data.get("times", 2)))
+        elif t == "monthly":
+            day = data.get("day")
+            data["day"] = int(day) if day is not None and 1 <= int(day) <= 31 else None
+        elif t == "monthly_count":
+            data["times"] = max(1, int(data.get("times", 1)))
+
+        return data
+    except Exception as e:
+        print(f"Recurrence AI Error: {e}")
+        return None
+
+
+async def parse_recurrence(raw_text):
+    """
+    يحاول فهم صيغة التكرار عبر Claude API أولاً (يدعم أي لهجة واحتمال صياغة).
+    إذا فشل (لا يوجد مفتاح API، أو خطأ شبكة، أو رد غير متوقع)، يرجع تلقائياً
+    لتحليل القواعد اليدوية البسيط حتى لا يتعطل البوت.
+    """
+    ai_result = await parse_recurrence_ai(raw_text)
+    if ai_result:
+        return ai_result
+    return parse_recurrence_rules(raw_text)
+
+
 def recurrence_description(rec, created_dt=None):
     t = rec.get("type", "daily")
     if t == "daily":
@@ -640,6 +801,8 @@ def recurrence_description(rec, created_dt=None):
             wd = created_dt.weekday()
         names = {0: "الإثنين", 1: "الثلاثاء", 2: "الأربعاء", 3: "الخميس", 4: "الجمعة", 5: "السبت", 6: "الأحد"}
         return f"أسبوعياً (كل {names.get(wd, 'نفس اليوم')})"
+    if t == "weekly_count":
+        return f"{rec['times']} مرات بالأسبوع"
     if t == "monthly":
         day = rec.get("day")
         if day is None and created_dt:
@@ -686,6 +849,19 @@ def next_run_datetime(hour, minute, rec, now=None, created_dt=None):
         candidate += datetime.timedelta(days=days_ahead)
         if candidate <= now:
             candidate += datetime.timedelta(days=7)
+        return candidate
+
+    if t == "weekly_count":
+        times = max(1, rec.get("times", 2))
+        interval_days = max(1, 7 // times)
+        candidate = base
+        if created_dt:
+            ref = created_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            elapsed = (now - ref).days
+            cycles = (elapsed // interval_days) + 1
+            candidate = ref + datetime.timedelta(days=interval_days * cycles)
+        if candidate <= now:
+            candidate += datetime.timedelta(days=interval_days)
         return candidate
 
     if t == "monthly":
@@ -735,13 +911,26 @@ def schedule_keyboard():
         [Button.inline("📋 عرض الجدولات", b"sched_list")],
     ]
 
-def schedule_item_keyboard(sched_id):
-    return [
-        [
-            Button.inline("✏️ تعديل الوقت", f"sched_edit_{sched_id}".encode()),
-            Button.inline("🗑️ حذف", f"sched_del_{sched_id}".encode()),
-        ]
-    ]
+def schedule_list_keyboard(sched_ids):
+    """
+    لوحة مفاتيح موحّدة لرسالة عرض كل الجدولات: زر حذف وزر تعديل لكل جدولة
+    (مرقّمة بترتيب ظهورها بالرسالة)، وفي الأسفل زر رجوع واحد للقائمة الرئيسية.
+    """
+    rows = []
+    for idx, sid in enumerate(sched_ids, start=1):
+        rows.append([
+            Button.inline(f"✏️ تعديل #{idx}", f"sched_edit_{sid}".encode()),
+            Button.inline(f"🗑️ حذف #{idx}", f"sched_del_{sid}".encode()),
+        ])
+    rows.append([Button.inline("🔙 رجوع", b"sched_back")])
+    return rows
+
+
+def truncate_preview(text, limit=60):
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit - 3] + "..."
 
 
 async def schedule_loop(sched_id, time_index):
@@ -844,20 +1033,35 @@ async def schedule_list(event):
     if not chat_schedules:
         return await event.edit("لا توجد جدولات حالياً في هذه المجموعة.", buttons=schedule_keyboard())
 
-    await event.edit("📋 الجدولات الحالية:", buttons=schedule_keyboard())
-    for sid, s in chat_schedules.items():
+    sched_ids = list(chat_schedules.keys())
+    lines = ["📋 الجدولات الحالية:\n"]
+
+    for idx, sid in enumerate(sched_ids, start=1):
+        s = chat_schedules[sid]
         times_str = " / ".join(f"{t['hour']:02d}:{t['minute']:02d}" for t in s.get("times", []))
         content = s.get("content", {})
         if content.get("type") == "media":
-            preview = f"[{content.get('media_kind', 'وسائط')}]" + (f" — {content.get('caption','')[:50]}" if content.get('caption') else "")
+            kind = content.get("media_kind", "وسائط")
+            caption_preview = truncate_preview(content.get("caption", ""), 40)
+            preview = f"[{kind}]" + (f" — {caption_preview}" if caption_preview else "")
         else:
-            txt = content.get("text", "")
-            preview = txt if len(txt) <= 80 else txt[:77] + "..."
+            preview = truncate_preview(content.get("text", ""), 60)
         rec_desc = recurrence_description(s.get("recurrence", {"type": "daily"}))
-        msg = f"⏰ الأوقات: {times_str}\n🔁 التكرار: {rec_desc}\n📝 المحتوى: {preview}"
-        await client.send_message(
-            event.chat_id, msg, buttons=schedule_item_keyboard(sid)
+
+        lines.append(
+            f"#{idx} ⏰ {times_str} | 🔁 {rec_desc}\n"
+            f"   📝 {preview}"
         )
+
+    full_message = "\n\n".join(lines)
+    await event.edit(full_message, buttons=schedule_list_keyboard(sched_ids))
+
+
+@client.on(events.CallbackQuery(data=b"sched_back"))
+async def schedule_back(event):
+    if not await is_admin(event):
+        return await event.answer("ليس لديك صلاحية.", alert=True)
+    await event.edit("⏰ قائمة جدولة الرسائل التلقائية:", buttons=schedule_keyboard())
 
 
 @client.on(events.CallbackQuery(pattern=rb"^sched_del_(.+)$"))
@@ -882,22 +1086,12 @@ async def schedule_delete(event):
         except Exception as e:
             print(f"Setup messages delete error: {e}")
 
-        try:
-            await event.delete()  # حذف بطاقة عرض هذه الجدولة نفسها
-        except:
-            pass
-
-        confirm = await client.send_message(chat_id, "🗑️ تم حذف الجدولة.")
-        await asyncio.sleep(3)
-        try:
-            await confirm.delete()
-        except:
-            pass
+        await event.answer("🗑️ تم حذف الجدولة.")
+        # نحدّث رسالة القائمة الموحدة نفسها بدل حذفها أو إرسال رسالة جديدة
+        await schedule_list(event)
     else:
-        try:
-            await event.edit("❌ لم يتم العثور على هذه الجدولة (ربما حُذفت مسبقاً).")
-        except:
-            pass
+        await event.answer("❌ هذه الجدولة محذوفة مسبقاً.", alert=True)
+        await schedule_list(event)
 
 
 @client.on(events.CallbackQuery(pattern=rb"^sched_edit_(.+)$"))
@@ -907,7 +1101,8 @@ async def schedule_edit(event):
 
     sched_id = event.pattern_match.group(1).decode()
     if sched_id not in db["schedules"]:
-        return await event.edit("❌ لم يتم العثور على هذه الجدولة.")
+        await event.answer("❌ هذه الجدولة محذوفة مسبقاً.", alert=True)
+        return await schedule_list(event)
 
     scheduling_state[event.sender_id] = {
         "step": "edit_time",
@@ -917,7 +1112,8 @@ async def schedule_edit(event):
     }
     await event.edit(
         "🕖 أرسل الوقت/الأوقات الجديدة (نفس الصيغ المرنة مدعومة):\n"
-        "مثال: 7 صباحا — 19:30 — 7 صباحا و7 مساء"
+        "مثال: 7 صباحا — 19:30 — 7 صباحا و7 مساء",
+        buttons=[[Button.inline("🔙 إلغاء", b"sched_list")]],
     )
 
 
@@ -958,7 +1154,7 @@ async def schedule_conversation_handler(event):
         if text in ("تخطي", "تجاوز", "لا", "-"):
             rec = {"type": "daily"}
         else:
-            rec = parse_recurrence(text)
+            rec = await parse_recurrence(text)
         state["recurrence"] = rec
         state["step"] = "content"
         ask = await event.reply("📝 الآن أرسل نص الرسالة، أو أرسل صورة/فيديو (مع كابشن اختياري) لتُرسل تلقائياً.")
@@ -1069,8 +1265,22 @@ async def global_handler(event):
             "🌟 استمر في التفاعل لرفع ترتيبك!"
         )
 
+        # كاش لصورة الملف الشخصي (5 دقائق) لتجنب تحميل الصورة من تيليجرام
+        # في كل مرة يكتب فيها المستخدم "ا"، وهذا كان مصدر تأخير ملحوظ.
+        now = asyncio.get_event_loop().time()
+        cached_photo = _profile_photo_cache.get(event.sender_id)
+        photo = None
+        if cached_photo and cached_photo[1] > now:
+            photo = cached_photo[0]
+        else:
+            try:
+                photo = await client.download_profile_photo(event.sender_id)
+            except Exception as e:
+                print(f"Profile Photo Error: {e}")
+                photo = None
+            _profile_photo_cache[event.sender_id] = (photo, now + PROFILE_PHOTO_CACHE_TTL)
+
         try:
-            photo = await client.download_profile_photo(event.sender_id)
             if photo:
                 await client.send_file(event.chat_id, photo, caption=caption, reply_to=event.id)
             else:
