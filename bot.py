@@ -58,6 +58,8 @@ def load_db():
                     data["muted"] = {}
                 if "schedules" not in data:
                     data["schedules"] = {}
+                if "authorized_users" not in data:
+                    data["authorized_users"] = []
                 return data
         except:
             return create_empty_db()
@@ -71,6 +73,9 @@ def create_empty_db():
         "warnings": {},
         "muted": {},
         "schedules": {},
+        # قائمة معرّفات (IDs) الأشخاص المسموح لهم باستخدام أوامر التحكم
+        # بالمجموعات من الخاص (جدولة / رسالة فورية)، بالإضافة إلى الأونر.
+        "authorized_users": [],
         "meta": {"created": str(datetime.datetime.now())}
     }
 
@@ -139,6 +144,43 @@ async def is_admin(event):
 
     _admin_cache[cache_key] = (result, now + ADMIN_CACHE_TTL)
     return result
+
+
+async def is_admin_in_chat(chat_id, sender_id):
+    """
+    نفس فكرة is_admin لكنها تتحقق من صلاحية شخص بمجموعة محدّدة بدلاً من
+    الاعتماد على event.chat_id الحالي. تُستخدم في أوامر التحكم من الخاص
+    (جدولة/رسالة لمجموعة معيّنة)، حيث تكون المحادثة الحالية (الخاص) غير
+    المجموعة المستهدفة.
+    """
+    if sender_id == owner_id:
+        return True
+
+    cache_key = (chat_id, sender_id)
+    now = asyncio.get_event_loop().time()
+    cached = _admin_cache.get(cache_key)
+    if cached and cached[1] > now:
+        return cached[0]
+
+    try:
+        perms = await client.get_permissions(chat_id, sender_id)
+        result = bool(perms.is_admin)
+    except:
+        result = False
+
+    _admin_cache[cache_key] = (result, now + ADMIN_CACHE_TTL)
+    return result
+
+
+def is_authorized_dm(sender_id):
+    """
+    يتحقق إذا كان الشخص مسموح له باستخدام أوامر التحكم من الخاص
+    (جدولة / رسالة فورية لمجموعة معيّنة). الأونر مخوّل دائماً، بالإضافة
+    لأي شخص أضافه الأونر للقائمة المخوّلة (db["authorized_users"]).
+    """
+    if sender_id == owner_id:
+        return True
+    return sender_id in db.get("authorized_users", [])
 
 # ──────────────────────────────────────────────────────────────────────────────
 # =========================
@@ -1043,6 +1085,8 @@ def restart_all_schedules():
 
 @client.on(events.NewMessage(pattern=r'^جدولة$'))
 async def schedule_menu(event):
+    if event.is_private:
+        return  # تُعالج بمعالج dm_schedule_menu بالقسم 13 (التحكم من الخاص)
     if not await is_admin(event): return
     await event.reply("⏰ قائمة جدولة الرسائل التلقائية:", buttons=schedule_keyboard())
 
@@ -1055,6 +1099,7 @@ async def schedule_new(event):
     state = {
         "step": "time",
         "chat_id": event.chat_id,
+        "setup_chat_id": event.chat_id,  # محادثة الإعداد = نفس المجموعة هنا
         "conv_msg_ids": [],
     }
     scheduling_state[event.sender_id] = state
@@ -1122,15 +1167,17 @@ async def schedule_delete(event):
 
     if sched:
         # حذف كل رسائل ضبط الجدولة المرتبطة (من لحظة الضغط على "جدولة جديدة" حتى التأكيد)
+        # ملاحظة: محادثة الإعداد (setup_chat_id) قد تختلف عن المجموعة الهدف
+        # (chat_id) في حال أُنشئت الجدولة من الخاص لمجموعة بعيدة.
         setup_ids = sched.get("setup_msg_ids", [])
-        chat_id = int(sched["chat_id"])
+        setup_chat_id = int(sched.get("setup_chat_id", sched["chat_id"]))
         db["schedules"].pop(sched_id, None)
         save_db()
         stop_schedule_task(sched_id)
 
         try:
             if setup_ids:
-                await client.delete_messages(chat_id, setup_ids)
+                await client.delete_messages(setup_chat_id, setup_ids)
         except Exception as e:
             print(f"Setup messages delete error: {e}")
 
@@ -1170,7 +1217,13 @@ async def schedule_conversation_handler(event):
     """يلتقط الرسائل أثناء عملية إنشاء/تعديل الجدولة (وقت → تكرار → محتوى)."""
     if event.sender_id not in scheduling_state:
         return
-    if not await is_admin(event):
+
+    # الصلاحية: بالمجموعات نتحقق بـ is_admin كالمعتاد، وبالخاص (تحكم بمجموعة
+    # مختارة عن بُعد) نتحقق من القائمة المخوّلة بدلاً من ذلك.
+    if event.is_private:
+        if not is_authorized_dm(event.sender_id):
+            return
+    elif not await is_admin(event):
         return
 
     state = scheduling_state[event.sender_id]
@@ -1228,6 +1281,7 @@ async def schedule_conversation_handler(event):
         sched_id = f"s{len(db['schedules']) + 1}_{int(datetime.datetime.now().timestamp())}"
         db["schedules"][sched_id] = {
             "chat_id": state["chat_id"],
+            "setup_chat_id": state.get("setup_chat_id", state["chat_id"]),
             "times": state["times"],
             "recurrence": state["recurrence"],
             "content": content,
@@ -1280,6 +1334,245 @@ async def schedule_conversation_handler(event):
 # ──────────────────────────────────────────────────────────────────────────────
 # =========================
 # القسم 13
+# التحكم بالمجموعات من الخاص (قائمة مخوّلين + جدولة / رسالة فورية)
+# =========================
+# ──────────────────────────────────────────────────────────────────────────────
+
+# حالة محادثة "رسالة فورية لمجموعة" من الخاص: sender_id -> dict
+# {"step": "content"/..., "chat_id": <معرف المجموعة المختارة>}
+dm_instant_state = {}
+
+DM_GROUPS_PAGE_SIZE = 8
+
+
+async def get_bot_groups():
+    """
+    يرجع قائمة (chat_id, title) لكل المجموعات/السوبرجروبات اللي البوت
+    عضو فيها حالياً، عبر تصفّح محادثات البوت (iter_dialogs).
+    """
+    groups = []
+    async for dialog in client.iter_dialogs():
+        entity = dialog.entity
+        is_group_like = getattr(entity, "megagroup", False) or dialog.is_group
+        if is_group_like:
+            title = dialog.title or "بدون اسم"
+            groups.append((dialog.id, title))
+    return groups
+
+
+def dm_groups_keyboard(groups, action_prefix, page=0):
+    """
+    يبني لوحة أزرار لاختيار مجموعة من قائمة، مع ترقيم صفحات لو كانت
+    القائمة طويلة. action_prefix يحدد الإجراء التالي بعد الاختيار
+    (مثلاً "dmsched" للجدولة أو "dminstant" للرسالة الفورية).
+    """
+    start = page * DM_GROUPS_PAGE_SIZE
+    end = start + DM_GROUPS_PAGE_SIZE
+    page_groups = groups[start:end]
+
+    rows = []
+    for chat_id, title in page_groups:
+        label = title if len(title) <= 30 else title[:27] + "..."
+        rows.append([Button.inline(f"👥 {label}", f"{action_prefix}_pick_{chat_id}".encode())])
+
+    nav_row = []
+    if start > 0:
+        nav_row.append(Button.inline("◀️ السابق", f"{action_prefix}_page_{page-1}".encode()))
+    if end < len(groups):
+        nav_row.append(Button.inline("التالي ▶️", f"{action_prefix}_page_{page+1}".encode()))
+    if nav_row:
+        rows.append(nav_row)
+
+    rows.append([Button.inline("❌ إلغاء", f"{action_prefix}_cancel".encode())])
+    return rows
+
+
+# قاموس مؤقت يخزّن آخر قائمة مجموعات تم عرضها لكل مستخدم (لدعم الصفحات
+# بدون إعادة استدعاء iter_dialogs في كل ضغطة "التالي/السابق")
+_dm_groups_cache = {}
+
+
+@client.on(events.NewMessage(pattern=r'^جدولة$', func=lambda e: e.is_private))
+async def dm_schedule_menu(event):
+    if not is_authorized_dm(event.sender_id):
+        return await event.reply("⚠️ ما عندك صلاحية استخدام هذا الأمر من الخاص.")
+
+    groups = await get_bot_groups()
+    if not groups:
+        return await event.reply("❌ البوت غير عضو في أي مجموعة حالياً.")
+
+    _dm_groups_cache[event.sender_id] = groups
+    await event.reply(
+        "👥 اختر المجموعة التي تريد جدولة رسالة فيها:",
+        buttons=dm_groups_keyboard(groups, "dmsched", page=0),
+    )
+
+
+@client.on(events.NewMessage(pattern=r'^رسالة$', func=lambda e: e.is_private))
+async def dm_instant_menu(event):
+    if not is_authorized_dm(event.sender_id):
+        return await event.reply("⚠️ ما عندك صلاحية استخدام هذا الأمر من الخاص.")
+
+    groups = await get_bot_groups()
+    if not groups:
+        return await event.reply("❌ البوت غير عضو في أي مجموعة حالياً.")
+
+    _dm_groups_cache[event.sender_id] = groups
+    await event.reply(
+        "👥 اختر المجموعة التي تريد إرسال رسالة فورية فيها:",
+        buttons=dm_groups_keyboard(groups, "dminstant", page=0),
+    )
+
+
+@client.on(events.CallbackQuery(pattern=rb"^(dmsched|dminstant)_page_(\d+)$"))
+async def dm_groups_page(event):
+    if not is_authorized_dm(event.sender_id):
+        return await event.answer("⚠️ ما عندك صلاحية.", alert=True)
+
+    prefix = event.pattern_match.group(1).decode()
+    page = int(event.pattern_match.group(2))
+    groups = _dm_groups_cache.get(event.sender_id, [])
+    if not groups:
+        return await event.edit("❌ انتهت صلاحية هذه القائمة، أرسل الأمر من جديد.")
+
+    label = "جدولة رسالة" if prefix == "dmsched" else "إرسال رسالة فورية"
+    await event.edit(
+        f"👥 اختر المجموعة التي تريد {label} فيها:",
+        buttons=dm_groups_keyboard(groups, prefix, page=page),
+    )
+
+
+@client.on(events.CallbackQuery(pattern=rb"^(dmsched|dminstant)_cancel$"))
+async def dm_groups_cancel(event):
+    await event.edit("❌ تم الإلغاء.")
+
+
+@client.on(events.CallbackQuery(pattern=rb"^dmsched_pick_(-?\d+)$"))
+async def dm_schedule_pick_group(event):
+    if not is_authorized_dm(event.sender_id):
+        return await event.answer("⚠️ ما عندك صلاحية.", alert=True)
+
+    target_chat_id = int(event.pattern_match.group(1))
+
+    # نبدأ نفس تدفق الجدولة المستخدم بالمجموعات (وقت → تكرار → محتوى)،
+    # لكن chat_id هنا هو المجموعة المختارة، و setup_chat_id هو محادثة
+    # الخاص الحالية (حيث تجري كل خطوات الإعداد فعلياً).
+    state = {
+        "step": "time",
+        "chat_id": target_chat_id,
+        "setup_chat_id": event.chat_id,
+        "conv_msg_ids": [],
+    }
+    scheduling_state[event.sender_id] = state
+
+    msg = await event.get_message()
+    state["conv_msg_ids"].append(msg.id)
+
+    await event.edit(
+        "🕖 أرسل وقت/أوقات الإرسال (يقبل صيغ متعددة):\n"
+        "مثال: 7 صباحا — ٧:٣٠ — 19:30 — 7 صباحا و7 مساء"
+    )
+
+
+@client.on(events.CallbackQuery(pattern=rb"^dminstant_pick_(-?\d+)$"))
+async def dm_instant_pick_group(event):
+    if not is_authorized_dm(event.sender_id):
+        return await event.answer("⚠️ ما عندك صلاحية.", alert=True)
+
+    target_chat_id = int(event.pattern_match.group(1))
+
+    dm_instant_state[event.sender_id] = {
+        "chat_id": target_chat_id,
+    }
+
+    await event.edit(
+        "📝 أرسل الآن نص الرسالة، أو صورة/فيديو (مع كابشن اختياري)، "
+        "وسيتم إرسالها فوراً للمجموعة المختارة."
+    )
+
+
+@client.on(events.NewMessage(func=lambda e: e.is_private))
+async def dm_instant_content_handler(event):
+    """يستقبل محتوى الرسالة الفورية بعد اختيار المجموعة من dm_instant_menu."""
+    if event.sender_id not in dm_instant_state:
+        return
+    if not is_authorized_dm(event.sender_id):
+        return
+
+    state = dm_instant_state.pop(event.sender_id)
+    target_chat_id = state["chat_id"]
+    text = event.text.strip() if event.text else ""
+
+    try:
+        if event.photo or event.video:
+            await client.send_file(target_chat_id, event.media, caption=text or None)
+        elif text:
+            await client.send_message(target_chat_id, text)
+        else:
+            dm_instant_state[event.sender_id] = state  # نرجّع الحالة، المحتوى غير صالح
+            return await event.reply("⚠️ أرسل نص الرسالة أو صورة/فيديو.")
+
+        await event.reply("✅ تم إرسال الرسالة للمجموعة بنجاح.")
+    except Exception as e:
+        await event.reply(f"❌ فشل إرسال الرسالة: {e}")
+
+
+# -------- إدارة القائمة المخوّلة (للأونر فقط) -------- #
+
+@client.on(events.NewMessage(pattern=r'(?i)^اضافة\s+(\d+)$|^إضافة\s+(\d+)$', func=lambda e: e.is_private))
+async def add_authorized_user(event):
+    if event.sender_id != owner_id:
+        return
+
+    raw_id = event.pattern_match.group(1) or event.pattern_match.group(2)
+    new_id = int(raw_id)
+
+    if new_id == owner_id:
+        return await event.reply("ℹ️ أنت الأونر بالفعل، عندك كل الصلاحيات.")
+
+    if new_id in db["authorized_users"]:
+        return await event.reply("ℹ️ هذا المعرف مخوّل بالفعل.")
+
+    db["authorized_users"].append(new_id)
+    save_db()
+    await event.reply(f"✅ تمت إضافة {new_id} للقائمة المخوّلة بأوامر الجدولة/الرسالة من الخاص.")
+
+
+@client.on(events.NewMessage(pattern=r'(?i)^حذف\s+مخول\s+(\d+)$', func=lambda e: e.is_private))
+async def remove_authorized_user(event):
+    if event.sender_id != owner_id:
+        return
+
+    target_id = int(event.pattern_match.group(1))
+    if target_id not in db["authorized_users"]:
+        return await event.reply("ℹ️ هذا المعرف غير موجود بالقائمة.")
+
+    db["authorized_users"].remove(target_id)
+    save_db()
+    await event.reply(f"🗑️ تمت إزالة {target_id} من القائمة المخوّلة.")
+
+
+@client.on(events.NewMessage(pattern=r'(?i)^المخولين$', func=lambda e: e.is_private))
+async def list_authorized_users(event):
+    if event.sender_id != owner_id:
+        return
+
+    authorized = db.get("authorized_users", [])
+    if not authorized:
+        return await event.reply(
+            "📋 لا يوجد أشخاص مخوّلون حالياً (بالإضافة للأونر).\n"
+            "لإضافة أحد، اكتب: إضافة <ID>"
+        )
+
+    lines = ["📋 القائمة المخوّلة بأوامر الخاص:\n"]
+    for uid in authorized:
+        lines.append(f"• {uid}")
+    lines.append("\nلإضافة: إضافة <ID>\nللحذف: حذف مخول <ID>")
+    await event.reply("\n".join(lines))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# =========================
+# القسم 14
 # معالج الرسائل العام (الردود التلقائية + بروفايل)
 # =========================
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1353,7 +1646,7 @@ async def global_handler(event):
 
 # ──────────────────────────────────────────────────────────────────────────────
 # =========================
-# القسم 14
+# القسم 15
 # تشغيل البوت
 # =========================
 # ──────────────────────────────────────────────────────────────────────────────
