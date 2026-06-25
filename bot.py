@@ -22,7 +22,7 @@ except ImportError:
 
 api_id = 34257542
 api_hash = '614a1b5c5b712ac6de5530d5c571c42a'
-bot_token = '7957660443:AAHHScyv4J72MM8X3WaaHhRrPiXMz35MqEU'
+bot_token = '7957660443:AAFOZTMcDv-eg9mKLtkvK01Trv-zzRQbwWw'
 owner_id = 1486879970
 
 # مفتاح Claude API لفهم صيغ التكرار الحرة (مرتين بالأسبوع، كل خميسين، إلخ).
@@ -60,6 +60,8 @@ def load_db():
                     data["schedules"] = {}
                 if "authorized_users" not in data:
                     data["authorized_users"] = []
+                if "known_groups" not in data:
+                    data["known_groups"] = {}
                 return data
         except:
             return create_empty_db()
@@ -76,6 +78,12 @@ def create_empty_db():
         # قائمة معرّفات (IDs) الأشخاص المسموح لهم باستخدام أوامر التحكم
         # بالمجموعات من الخاص (جدولة / رسالة فورية)، بالإضافة إلى الأونر.
         "authorized_users": [],
+        # سجل المجموعات التي البوت عضو فيها: {str(chat_id): title}.
+        # البوتات ممنوعة من استخدام GetDialogsRequest (خطأ BotMethodInvalidError)،
+        # فلا نقدر نستعرض محادثات البوت مباشرة من API كما يفعل حساب مستخدم عادي.
+        # الحل: نسجّل كل مجموعة تلقائياً وقت دخول البوت لها أو أول رسالة يرصدها
+        # فيها، ونحدّث هذا السجل بدلاً من الاعتماد على iter_dialogs.
+        "known_groups": {},
         "meta": {"created": str(datetime.datetime.now())}
     }
 
@@ -182,6 +190,32 @@ def is_authorized_dm(sender_id):
         return True
     return sender_id in db.get("authorized_users", [])
 
+
+def register_known_group(chat_id, title):
+    """
+    يسجّل/يحدّث مجموعة بسجل known_groups. تُستدعى من أي حدث يصل من
+    مجموعة (رسالة جديدة أو دخول البوت)، لأن البوتات ممنوعة من استخدام
+    GetDialogsRequest ولا تقدر "تستعرض" قائمة محادثاتها مباشرة من API.
+    """
+    key = str(chat_id)
+    title = title or "بدون اسم"
+    if db["known_groups"].get(key) != title:
+        db["known_groups"][key] = title
+        save_db()
+
+
+@client.on(events.NewMessage)
+async def group_registry_handler(event):
+    """
+    معالج خفيف جداً (بدون أي await أو شبكة) يسجّل كل مجموعة يصل منها
+    البوت أي رسالة، لتعويض عدم إمكانية استخدام iter_dialogs مع البوتات.
+    """
+    if event.is_private or not event.is_group:
+        return
+    chat = event.chat
+    title = getattr(chat, "title", None) if chat else None
+    register_known_group(event.chat_id, title)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # =========================
 # القسم 4
@@ -194,6 +228,15 @@ def is_authorized_dm(sender_id):
 async def welcome(event):
     if event.user_joined:
         user = await event.get_user()
+
+        # لو المنضم هو البوت نفسه (تمت إضافته لمجموعة جديدة): نسجّل
+        # المجموعة فوراً بسجل known_groups، ولا نرسل رسالة ترحيب له.
+        my_id = await get_bot_id()
+        if user.id == my_id:
+            chat = await event.get_chat()
+            title = getattr(chat, "title", None)
+            register_known_group(event.chat_id, title)
+            return
 
         welcome_text = (
             f"اهلاً بك في فجر جديد [{user.first_name}](tg://user?id={user.id}) 🙋🏻‍♂️\n\n"
@@ -1347,17 +1390,21 @@ DM_GROUPS_PAGE_SIZE = 8
 
 async def get_bot_groups():
     """
-    يرجع قائمة (chat_id, title) لكل المجموعات/السوبرجروبات اللي البوت
-    عضو فيها حالياً، عبر تصفّح محادثات البوت (iter_dialogs).
+    يرجع قائمة (chat_id, title) لكل المجموعات/السوبرجروبات المسجّلة في
+    db["known_groups"].
+
+    ملاحظة مهمة: تيليجرام يمنع حسابات البوتات من استخدام GetDialogsRequest
+    (الطريقة التي يستخدمها iter_dialogs)، ويرمي BotMethodInvalidError عند
+    أي محاولة استخدامها. لذلك لا توجد طريقة لـ"استعراض" محادثات البوت
+    مباشرة من الـ API كما يفعل حساب مستخدم عادي. الحل المعتمد هنا: نسجّل
+    كل مجموعة فور دخول البوت لها أو أول رسالة تصل منها (عبر
+    register_known_group بالقسم 3 ومعالج welcome بالقسم 4)، ونقرأ هذي
+    القائمة المحفوظة هنا بدل تصفّحها من الـ API.
     """
-    groups = []
-    async for dialog in client.iter_dialogs():
-        entity = dialog.entity
-        is_group_like = getattr(entity, "megagroup", False) or dialog.is_group
-        if is_group_like:
-            title = dialog.title or "بدون اسم"
-            groups.append((dialog.id, title))
-    return groups
+    return [
+        (int(chat_id), title)
+        for chat_id, title in db.get("known_groups", {}).items()
+    ]
 
 
 def dm_groups_keyboard(groups, action_prefix, page=0):
@@ -1399,7 +1446,11 @@ async def dm_schedule_menu(event):
 
     groups = await get_bot_groups()
     if not groups:
-        return await event.reply("❌ البوت غير عضو في أي مجموعة حالياً.")
+        return await event.reply(
+            "❌ لا توجد مجموعات مسجّلة عند البوت حالياً.\n"
+            "اكتب أي رسالة عادية (مثل: مرحبا) داخل كل مجموعة تريد التحكم بها، "
+            "ثم جرّب هذا الأمر مرة أخرى."
+        )
 
     _dm_groups_cache[event.sender_id] = groups
     await event.reply(
@@ -1415,7 +1466,11 @@ async def dm_instant_menu(event):
 
     groups = await get_bot_groups()
     if not groups:
-        return await event.reply("❌ البوت غير عضو في أي مجموعة حالياً.")
+        return await event.reply(
+            "❌ لا توجد مجموعات مسجّلة عند البوت حالياً.\n"
+            "اكتب أي رسالة عادية (مثل: مرحبا) داخل كل مجموعة تريد التحكم بها، "
+            "ثم جرّب هذا الأمر مرة أخرى."
+        )
 
     _dm_groups_cache[event.sender_id] = groups
     await event.reply(
