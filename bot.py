@@ -22,7 +22,7 @@ except ImportError:
 
 api_id = 34257542
 api_hash = '614a1b5c5b712ac6de5530d5c571c42a'
-bot_token = '7957660443:AAHHScyv4J72MM8X3WaaHhRrPiXMz35MqEU'
+bot_token = '7957660443:AAH3cDCqtKcXHeAh01k044M6ghypxCAO1TA'
 owner_id = 1486879970
 
 # مفتاح Claude API لفهم صيغ التكرار الحرة (مرتين بالأسبوع، كل خميسين، إلخ).
