@@ -31,9 +31,9 @@ except ImportError:
 # القسم 1: الإعدادات الأساسية
 # ══════════════════════════════════════════════════════════════════════════════
 
-api_id = int(os.environ.get("34257542") or 0)
-api_hash = os.environ.get("614a1b5c5b712ac6de5530d5c571c42a") or ""
-bot_token = os.environ.get("7957660443:AAGyTDPHQNetmmfO0qZfDW7ylJbq1STIN1Q") or ""
+api_id = int(os.environ.get("API_ID") or 0)
+api_hash = os.environ.get("API_HASH") or ""
+bot_token = os.environ.get("BOT_TOKEN") or ""
 owner_id = int(os.environ.get("OWNER_ID") or 1486879970)
 
 if not (api_id and api_hash and bot_token):
